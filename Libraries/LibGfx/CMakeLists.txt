@@ -9,6 +9,7 @@ set(SOURCES
     Font.cpp
     GIFLoader.cpp
     ImageDecoder.cpp
+    JPGLoader.cpp
     Painter.cpp
     Palette.cpp
     Path.cpp
