@@ -27,10 +27,9 @@
 #include <AK/Bitmap.h>
 #include <AK/BufferStream.h>
 #include <AK/ByteBuffer.h>
-#include <AK/FileSystemPath.h>
+#include <AK/LexicalPath.h>
 #include <AK/MappedFile.h>
 #include <AK/String.h>
-#include <AK/StringBuilder.h>
 #include <AK/Vector.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/JPGLoader.h>
@@ -42,7 +41,7 @@ namespace Gfx {
     RefPtr<Gfx::Bitmap> load_jpg (const StringView& path);
     RefPtr<Gfx::Bitmap> load_jpg_from_memory (const u8*, size_t);
 
-    static const u8 zigzag_map[64] {
+    static const u8 zigzag_map[64]{
         0, 1, 8, 16, 9, 2, 3, 10,
         17, 24, 32, 25, 18, 11, 4, 5,
         12, 19, 26, 33, 40, 48, 41, 34,
@@ -76,7 +75,7 @@ namespace Gfx {
                 return {};
             }
             u8 current_byte = hstream.stream[hstream.byte_offset];
-            u8 current_bit = 1u & (u32) (current_byte >> (7 - hstream.bit_offset)); // MSB first.
+            u8 current_bit = 1u & (u32)(current_byte >> (7 - hstream.bit_offset)); // MSB first.
             hstream.bit_offset++;
             value = (value << 1) | (size_t) current_bit;
             if (hstream.bit_offset == 8) {
@@ -101,14 +100,14 @@ namespace Gfx {
             }
         }
 
-        return {};
+        ASSERT_NOT_REACHED();
     }
 
     Optional<MCU> build_mcu (JPGLoadingContext& context) {
         MCU mcu;
-        int component_count = context.scan_header.component_count;
+        int component_count = context.component_count;
         for (int component_index = 0; component_index < component_count; component_index++) {
-            auto& component = context.scan_header.components[component_index];
+            auto& component = context.components[component_index];
             //    Component(s)        Table(Dest_ID)   Location
             //    Luma (Y)              DC (0)       dc_tables[0]
             //    Chroma (Cb, Cr)       DC (1)       dc_tables[1]
@@ -182,18 +181,13 @@ namespace Gfx {
     }
 
     Optional<Vector<MCU>> decode_huffman_stream (JPGLoadingContext& context) {
-        // Each MCU is an 8x8 pixel matrix.
-        // Round up the number of fitting MCUs in a row/column.
-        u32 x_mcu_count = (context.frame.width + 7) / 8;
-        u32 y_mcu_count = (context.frame.height + 7) / 8;
-        u32 total_mcus = x_mcu_count * y_mcu_count;
         Vector<MCU> mcus;
-        mcus.ensure_capacity(total_mcus);
+        mcus.ensure_capacity(context.mcu_meta.count);
 
         dbg() << "Image Width: " << context.frame.width;
         dbg() << "Image Height: " << context.frame.height;
-        dbg() << "MCUs per row: " << x_mcu_count;
-        dbg() << "MCUs per column: " << y_mcu_count;
+        dbg() << "MCUs per row: " << context.mcu_meta.count_per_row;
+        dbg() << "MCUs per column: " << context.mcu_meta.count_per_column;
 
         // Compute huffman codes for dc and ac tables.
         for (auto& dc_table : context.dc_tables)
@@ -203,7 +197,7 @@ namespace Gfx {
             generate_huffman_codes(ac_table);
 
         // Build MCUs.
-        for (u32 i = 0; i < total_mcus; i++) {
+        for (u32 i = 0; i < context.mcu_meta.count; i++) {
             if (context.dc_reset_interval > 0) {
                 if (i % context.dc_reset_interval == 0) {
                     context.previous_dc_values[0] = 0;
@@ -219,8 +213,8 @@ namespace Gfx {
                     }
                 }
             }
-            auto result = build_mcu(context);
 
+            auto result = build_mcu(context);
             if (!result.has_value()) {
                 dbg() << "Failed to build MCU " << i + 1;
                 dbg() << "Huffman stream byte offset " << context.huffman_stream.byte_offset;
@@ -262,7 +256,7 @@ namespace Gfx {
     }
 
     static inline u16 read_endian_swapped_word (BufferStream& stream) {
-        u16 temp { 0 };
+        u16 temp{0};
         stream >> temp;
         return (temp >> 8) | (temp << 8);
     }
@@ -320,7 +314,7 @@ namespace Gfx {
             }
         }
 
-        return false;
+        ASSERT_NOT_REACHED();
     }
 
     static bool read_start_of_scan (BufferStream& stream, JPGLoadingContext& context) {
@@ -329,36 +323,43 @@ namespace Gfx {
             return false;
         }
 
-        StartOfScan start_of_scan;
         u16 bytes_to_read = read_endian_swapped_word(stream);
         if (stream.handle_read_failure())
             return false;
         bytes_to_read -= 2;
         if (!bounds_okay(stream.offset(), bytes_to_read, context.compressed_size))
             return false;
-        stream >> start_of_scan.component_count;
-        if (start_of_scan.component_count < 1 || start_of_scan.component_count > 3) {
+        u8 component_count;
+        stream >> component_count;
+        if (component_count != context.component_count) {
             dbg() << stream.offset()
-                  << String::format(": Unsupported number of components: %i!", start_of_scan.component_count);
+                  << String::format(": Unsupported number of components: %i!", component_count);
             return false;
         }
-        bool zero_based_id;
-        for (int i = 0; i < start_of_scan.component_count; i++) {
-            StartOfScan::Component component;
-            stream >> component.id;
-            if (i == 0)
-                zero_based_id = component.id == 0;
-            component.id += zero_based_id ? 1 : 0;
-            if (component.id > 3) {
-                dbg() << stream.offset() << String::format(": Unsupported component id: %i!", component.id);
+
+        for (int i = 0; i < component_count; i++) {
+            Component* component = nullptr;
+            u8 component_id;
+            stream >> component_id;
+            component_id += context.has_zero_based_ids ? 1 : 0;
+
+            if (component_id == context.components[0].id)
+                component = &context.components[0];
+            else if (component_id == context.components[1].id)
+                component = &context.components[1];
+            else if (component_id == context.components[2].id)
+                component = &context.components[2];
+            else {
+                dbg() << stream.offset() << String::format(": Unsupported component id: %i!", component_id);
                 return false;
             }
+
             u8 table_ids;
             stream >> table_ids;
-            component.dc_destination_id = table_ids >> 4;
-            component.ac_destination_id = table_ids & 0x0F;
-            start_of_scan.components[i] = component;
+            component->dc_destination_id = table_ids >> 4;
+            component->ac_destination_id = table_ids & 0x0F;
         }
+
         u8 start_of_selection;
         stream >> start_of_selection;
         u8 end_of_selection;
@@ -372,7 +373,6 @@ namespace Gfx {
                   << ", Successive Approximation: " << successive_approximation << "!";
             return false;
         }
-        context.scan_header = move(start_of_scan);
         return true;
     }
 
@@ -444,22 +444,32 @@ namespace Gfx {
         return true;
     }
 
+    static inline void set_mcu_metadata (JPGLoadingContext& context) {
+        context.mcu_meta.count_per_row = (context.frame.width + 7) / 8;
+        context.mcu_meta.count_per_column = (context.frame.height + 7) / 8;
+        context.mcu_meta.count = context.mcu_meta.count_per_row * context.mcu_meta.count_per_column;
+    }
+
     static bool read_start_of_frame (BufferStream& stream, JPGLoadingContext& context) {
         if (context.state == JPGLoadingContext::FrameDecoded) {
             dbg() << stream.offset() << ": SOF repeated!";
             return false;
         }
+
         i32 bytes_to_read = read_endian_swapped_word(stream);
         if (stream.handle_read_failure())
             return false;
+
         bytes_to_read -= 2;
         if (!bounds_okay(stream.offset(), bytes_to_read, context.compressed_size))
             return false;
+
         stream >> context.frame.precision;
         if (context.frame.precision != 8) {
             dbg() << stream.offset() << ": SOF precision != 8!";
             return false;
         }
+
         context.frame.height = read_endian_swapped_word(stream);
         context.frame.width = read_endian_swapped_word(stream);
         if (!context.frame.width || !context.frame.height) {
@@ -467,29 +477,30 @@ namespace Gfx {
                   << context.frame.width << "!";
             return false;
         }
-        stream >> context.frame.component_count;
-        if (context.frame.component_count != 1 && context.frame.component_count != 3) {
+        set_mcu_metadata(context);
+
+        stream >> context.component_count;
+        if (context.component_count != 1 && context.component_count != 3) {
             dbg() << stream.offset() << ": Unsupported number of components in SOF: "
-                  << context.frame.component_count << "!";
+                  << context.component_count << "!";
             return false;
         }
-        bool zero_based_id;
-        for (int i = 0; i < context.frame.component_count; i++) {
-            StartOfFrame::Component component;
+
+        for (int i = 0; i < context.component_count; i++) {
+            Component& component = context.components[i];
             stream >> component.id;
-            if (i == 0)
-                zero_based_id = component.id == 0;
-            component.id += zero_based_id ? 1 : 0;
-            // FIXME: skipping the sampling factors for now.
-            stream.advance(1);
-            stream >> component.quantization_table_id;
-            if (component.quantization_table_id > 1) {
+            if (i == 0) context.has_zero_based_ids = component.id == 0;
+            component.id += context.has_zero_based_ids ? 1 : 0;
+            u8 subsample_factors;
+            stream >> subsample_factors;
+            component.hsample_factor = subsample_factors >> 4;
+            component.vsample_factor = subsample_factors & 0x0F;
+            stream >> component.qtable_id;
+            if (component.qtable_id > 1) {
                 dbg() << stream.offset() << ": Unsupported quantization table id: "
-                      << component.quantization_table_id << "!";
+                      << component.qtable_id << "!";
                 return false;
             }
-
-            context.frame.components[i] = component;
         }
         return true;
     }
@@ -595,24 +606,24 @@ namespace Gfx {
             }
         }
 
-        return false;
+        ASSERT_NOT_REACHED();
     }
 
-    void dequantize (const JPGLoadingContext& context, Vector<MCU> mcus) {
+    void dequantize(JPGLoadingContext& context, Vector<MCU>& mcus) {
         for (u32 i = 0; i < context.mcu_meta.count; i++) {
             auto& mcu = mcus[i];
-            for (u32 j = 0; j < context.frame.component_count; j++) {
-                auto& component = context.frame.components[j];
-                const u32* table = component.quantization_table_id == 0 ? context.luma_table : context.chroma_table;
-                i32* mcu_component = j == 0 ? mcu.y : (j == 1 ? mcu.cb : mcu.cr);
-                for (int k = 0; k < 64; k++)
+            for (u32 j = 0; j < context.component_count; j++) {
+                auto& component = context.components[j];
+                const u32* table = component.qtable_id == 0 ? context.luma_table : context.chroma_table;
+                int* mcu_component = j == 0 ? mcu.y : (j == 1 ? mcu.cb : mcu.cr);
+                for (u32 k = 0; k < 64; k++)
                     mcu_component[k] *= table[k];
             }
         }
     }
 
-    void inverse_dct (const JPGLoadingContext& context, Vector<MCU>& mcus) {
-        // IDCT scaling factors.
+
+    void inverse_dct(const JPGLoadingContext& context, Vector<MCU>& mcus) {
         static const float m0 = 2.0 * cos(1.0 / 16.0 * 2.0 * M_PI);
         static const float m1 = 2.0 * cos(2.0 / 16.0 * 2.0 * M_PI);
         static const float m3 = 2.0 * cos(2.0 / 16.0 * 2.0 * M_PI);
@@ -628,11 +639,11 @@ namespace Gfx {
         static const float s6 = cos(6.0 / 16.0 * M_PI) / 2.0;
         static const float s7 = cos(7.0 / 16.0 * M_PI) / 2.0;
 
-        for (u32 i = 0; i < context.mcu_meta.count; ++i) {
+        for (u32 i = 0; i < context.mcu_meta.count; i++) {
             auto& mcu = mcus[i];
-            for (int j = 0; j < context.frame.component_count; j++) {
+            for (int j = 0; j < context.component_count; j++) {
                 i32* component = j == 0 ? mcu.y : (j == 1 ? mcu.cb : mcu.cr);
-                for (int k = 0; k < 8; k++) {
+                for (u32 k = 0; k < 8; ++k) {
                     const float g0 = component[0 * 8 + k] * s0;
                     const float g1 = component[4 * 8 + k] * s4;
                     const float g2 = component[2 * 8 + k] * s2;
@@ -699,16 +710,15 @@ namespace Gfx {
                     component[6 * 8 + k] = b1 - b6;
                     component[7 * 8 + k] = b0 - b7;
                 }
-
-                for (u32 k = 0; k < 8; k++) {
-                    const float g0 = component[k * 8 + 0] * s0;
-                    const float g1 = component[k * 8 + 4] * s4;
-                    const float g2 = component[k * 8 + 2] * s2;
-                    const float g3 = component[k * 8 + 6] * s6;
-                    const float g4 = component[k * 8 + 5] * s5;
-                    const float g5 = component[k * 8 + 1] * s1;
-                    const float g6 = component[k * 8 + 7] * s7;
-                    const float g7 = component[k * 8 + 3] * s3;
+                for (u32 l = 0; l < 8; ++l) {
+                    const float g0 = component[l * 8 + 0] * s0;
+                    const float g1 = component[l * 8 + 4] * s4;
+                    const float g2 = component[l * 8 + 2] * s2;
+                    const float g3 = component[l * 8 + 6] * s6;
+                    const float g4 = component[l * 8 + 5] * s5;
+                    const float g5 = component[l * 8 + 1] * s1;
+                    const float g6 = component[l * 8 + 7] * s7;
+                    const float g7 = component[l * 8 + 3] * s3;
 
                     const float f0 = g0;
                     const float f1 = g1;
@@ -758,29 +768,29 @@ namespace Gfx {
                     const float b6 = c6 - c7;
                     const float b7 = c7;
 
-                    component[k * 8 + 0] = b0 + b7;
-                    component[k * 8 + 1] = b1 + b6;
-                    component[k * 8 + 2] = b2 + b5;
-                    component[k * 8 + 3] = b3 + b4;
-                    component[k * 8 + 4] = b3 - b4;
-                    component[k * 8 + 5] = b2 - b5;
-                    component[k * 8 + 6] = b1 - b6;
-                    component[k * 8 + 7] = b0 - b7;
+                    component[l * 8 + 0] = b0 + b7;
+                    component[l * 8 + 1] = b1 + b6;
+                    component[l * 8 + 2] = b2 + b5;
+                    component[l * 8 + 3] = b3 + b4;
+                    component[l * 8 + 4] = b3 - b4;
+                    component[l * 8 + 5] = b2 - b5;
+                    component[l * 8 + 6] = b1 - b6;
+                    component[l * 8 + 7] = b0 - b7;
                 }
             }
         }
     }
 
-    void ycbcr_to_rgb (const JPGLoadingContext& context, Vector<MCU>& mcus) {
+    void ycbcr_to_rgb(const JPGLoadingContext& context, Vector<MCU>& mcus) {
         for (u32 i = 0; i < context.mcu_meta.count; i++) {
             i32* y = mcus[i].y;
             i32* cb = mcus[i].cb;
             i32* cr = mcus[i].cr;
-            for (int j = 0; j < 64; j++) {
-                const int r = y[j] + 1.402f  * cr[j] + 128;
-                const int g = y[j] - 0.344f * cb[j] - 0.714f * cr[j] + 128;
-                const int b = y[j] + 1.772f * cb[j];
-                y[j] = r < 0 ? 0 : (r > 255 ? 255 : r);
+            for (u32 j = 0; j < 64; j++) {
+                int r = y[j] + 1.402 * cr[j] + 128;
+                int g = y[j] - 0.344f * cb[j] - 0.714f * cr[j] + 128;
+                int b = y[j] + 1.772 * cb[j] + 128;
+                y[j]  = r < 0 ? 0 : (r > 255 ? 255 : r);
                 cb[j] = g < 0 ? 0 : (g > 255 ? 255 : g);
                 cr[j] = b < 0 ? 0 : (b > 255 ? 255 : b);
             }
@@ -788,19 +798,17 @@ namespace Gfx {
     }
 
     static void compose_bitmap (JPGLoadingContext& context, const Vector<MCU>& mcus) {
-        context.bitmap = Bitmap::create_purgeable(BitmapFormat::RGB32, { context.frame.width, context.frame.height });
+        context.bitmap = Bitmap::create_purgeable(BitmapFormat::RGB32, {context.frame.width, context.frame.height});
 
-        for (ssize_t y = context.frame.height - 1; y >= 0; y--) {
+        for (u32 y = context.frame.height - 1; y < context.frame.height; y--) {
             const u32 mcu_row = y / 8;
             const u32 pixel_row = y % 8;
-            u32 x = 0;
-            for (x = 0; x < context.frame.width; x++) {
+            for (u32 x = 0; x < context.frame.width; x++) {
                 const u32 mcu_column = x / 8;
+                auto& mcu = mcus[mcu_row * context.mcu_meta.count_per_row + mcu_column];
                 const u32 pixel_column = x % 8;
-                const u32 mcu_index = (mcu_row * context.mcu_meta.width) + mcu_column;
-                const MCU& mcu = mcus[mcu_index];
-                const u32 pixel_index = (pixel_row * 8) + pixel_column;
-                const Color color { (u8) mcu.y[pixel_index], (u8) mcu.cb[pixel_index], (u8) mcu.cr[pixel_index] };
+                const u32 pixel_index = pixel_row * 8 + pixel_column;
+                const Color color {(u8)mcu.y[pixel_index], (u8)mcu.cb[pixel_index], (u8)mcu.cr[pixel_index]};
                 context.bitmap->set_pixel(x, y, color);
             }
         }
@@ -818,14 +826,10 @@ namespace Gfx {
         if (!result.has_value()) {
             dbg() << stream.offset() << ": Failed to decode MCUs!";
             return false;
-        } else {
+        }
+        else {
             auto mcus = result.release_value();
             dbg() << String::format("%i MCUs decoded successfully :^)", mcus.size());
-
-            context.mcu_meta.height = (context.frame.height + 7) / 8;
-            context.mcu_meta.width = (context.frame.width + 7) / 8;
-            context.mcu_meta.count = context.mcu_meta.height * context.mcu_meta.width;
-
             dequantize(context, mcus);
             inverse_dct(context, mcus);
             ycbcr_to_rgb(context, mcus);
@@ -847,7 +851,6 @@ namespace Gfx {
     Size JPGImageDecoderPlugin::size () {
         if (m_context->state == JPGLoadingContext::State::Error)
             return {};
-
         if (m_context->state >= JPGLoadingContext::State::FrameDecoded)
             return {m_context->frame.width, m_context->frame.height};
 
@@ -862,8 +865,9 @@ namespace Gfx {
                 m_context->state = JPGLoadingContext::State::Error;
                 return nullptr;
             }
-            m_context->state = JPGLoadingContext::BitmapDecoded;
+            m_context->state = JPGLoadingContext::State::BitmapDecoded;
         }
+
         return m_context->bitmap;
     }
 
@@ -895,7 +899,9 @@ namespace Gfx {
     }
 
     ImageFrameDescriptor JPGImageDecoderPlugin::frame (size_t i) {
-        if (i > 0) return { bitmap(), 0 };
+        if (i > 0) {
+            return {bitmap(), 0};
+        }
         return {};
     }
 
@@ -906,9 +912,8 @@ namespace Gfx {
         JPGImageDecoderPlugin jpg_decoder((const u8*) mapped_file.data(), mapped_file.size());
         auto bitmap = jpg_decoder.bitmap();
         if (bitmap)
-            bitmap->set_mmap_name(String::format("Gfx::Bitmap [%dx%d] - Decoded JPG: %s",
-                                                 bitmap->width(), bitmap->height(),
-                                                 canonicalized_path(path).characters()));
+            bitmap->set_mmap_name( String::format("Gfx::Bitmap [%dx%d] - Decoded JPG: %s",
+                bitmap->width(), bitmap->height(), LexicalPath::canonicalized_path(path).characters()));
         return bitmap;
     }
 }

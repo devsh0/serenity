@@ -87,46 +87,38 @@
 namespace Gfx {
 
     struct MCU {
-            i32 y[64] = { 0 };
-            i32 cb[64] = { 0 };
-            i32 cr[64] = { 0 };
+        i32 y[64] = { 0 };
+        i32 cb[64] = { 0 };
+        i32 cr[64] = { 0 };
     };
 
     struct MCUMeta {
         u32 count;
-        u32 width;
-        u32 height;
+        u32 count_per_row;
+        u32 count_per_column;
+        u32 padded_width;
+        u32 padded_height;
+    };
+
+    struct Component {
+        i8 id { -1 };
+        u8 hsample_factor { 1 }; // Horizontal sampling factor.
+        u8 vsample_factor { 1 }; // Vertical sampling factor.
+        u8 ac_destination_id;
+        u8 dc_destination_id;
+        u8 qtable_id; // Quantization table id.
     };
 
     struct StartOfFrame {
-        struct Component {
-            u8 id;
-            u8 horizontal_sample_factor { 1 };
-            u8 vertical_sample_factor { 1 };
-            u8 quantization_table_id;
-        };
-        enum FrameType {
+        enum class FrameType {
             Baseline = 0
             // Progressive = 1
         };
 
-        FrameType type { Baseline };
+        FrameType type { FrameType::Baseline };
         u8 precision;
         u16 height;
         u16 width;
-        u8 component_count;
-        Component components[3];
-    };
-
-    struct StartOfScan {
-        struct Component {
-            u8 id;
-            u8 dc_destination_id;
-            u8 ac_destination_id;
-        };
-
-        u8 component_count;
-        Component components[3];
     };
 
     struct HuffmanTable {
@@ -154,17 +146,18 @@ namespace Gfx {
         State state{State::NotDecoded};
         const u8* compressed_data { nullptr };
         size_t compressed_size { 0 };
-        size_t current { 0 };
         u32 luma_table[64];
         u32 chroma_table[64];
         StartOfFrame frame;
+        bool has_zero_based_ids;
+        u8 component_count;
+        Component components[3];
         RefPtr<Gfx::Bitmap> bitmap;
         u16 dc_reset_interval;
         Vector<HuffmanTable> dc_tables;
         Vector<HuffmanTable> ac_tables;
-        StartOfScan scan_header;
         HuffmanStreamState huffman_stream;
-        i32 previous_dc_values[3] { 0 };
+        i32 previous_dc_values[3] = { 0 };
         MCUMeta mcu_meta;
     };
 
