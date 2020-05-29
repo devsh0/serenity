@@ -93,11 +93,12 @@ namespace Gfx {
     };
 
     struct MCUMeta {
-        u32 count;
-        u32 count_per_row;
-        u32 count_per_column;
-        u32 padded_width;
-        u32 padded_height;
+        u32 total;
+        u32 padded_total;
+        u32 hcount;
+        u32 vcount;
+        u32 hpadded_count;
+        u32 vpadded_count;
     };
 
     struct Component {
@@ -149,6 +150,8 @@ namespace Gfx {
         u32 luma_table[64];
         u32 chroma_table[64];
         StartOfFrame frame;
+        u8 hsample_factor;
+        u8 vsample_factor;
         bool has_zero_based_ids;
         u8 component_count;
         Component components[3];

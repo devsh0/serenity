@@ -103,91 +103,106 @@ namespace Gfx {
         ASSERT_NOT_REACHED();
     }
 
-    Optional<MCU> build_mcu (JPGLoadingContext& context) {
-        MCU mcu;
-        int component_count = context.component_count;
-        for (int component_index = 0; component_index < component_count; component_index++) {
-            auto& component = context.components[component_index];
-            //    Component(s)        Table(Dest_ID)   Location
-            //    Luma (Y)              DC (0)       dc_tables[0]
-            //    Chroma (Cb, Cr)       DC (1)       dc_tables[1]
-            //    Luma (Y)              AC (0)       ac_tables[0]
-            //    Chroma (Cb, Cr)       AC (1)       ac_tables[1]
-            auto& dc_table = context.dc_tables[component.dc_destination_id];
-            auto& ac_table = context.ac_tables[component.ac_destination_id];
+    /*
+     * Build all the MCUs possible by reading single subsampled pair of cb-cr.
+     * Depending on the sampling factors, we may not see triples of y, cb, cr
+     * in that order. If sample factors differ from one, we'll read more than
+     * one block of y-coefficients before we get to read a cb-cr block.
+     *
+     * In the function below, `hindex` and `vindex` are the indices of row and column
+     * of this MCU in the giant MCU matrix. `sfactor_vi` and `sfactor_hi` are cursors
+     * that iterate over the vertical and horizontal subsampling factors, respectively.
+     * When we finish one iteration of the innermost loop, we'll have the coefficients
+     * of one of the components of MCU at position `mcu_index`. When the outermost loop
+     * finishes first iteration, we'll have all the luminance coefficients for all
+     * MCUs that share the chrominance data. Next two iterations (assuming that we're
+     * dealing with three components) will fill up the same MCUs with chrominance data.
+     */
+    bool build_mcus (JPGLoadingContext& context, Vector<MCU>& mcus, u8 hindex, u8 vindex) {
+        for (u32 cindex = 0; cindex < context.component_count; cindex++) {
+            auto& component = context.components[cindex];
+            for (u8 sfactor_vi = 0; sfactor_vi < component.vsample_factor; sfactor_vi++) {
+                for (u8 sfactor_hi = 0; sfactor_hi < component.hsample_factor; sfactor_hi++) {
+                    u32 mcu_index = (vindex + sfactor_vi) * context.mcu_meta.hpadded_count + (sfactor_hi + hindex);
+                    MCU& mcu = mcus[mcu_index];
 
-            auto symbol_read_result = get_next_symbol(context.huffman_stream, dc_table);
-            if (!symbol_read_result.has_value()) return {};
-            auto dc_symbol = symbol_read_result.release_value();
-            if (dc_symbol > 11) {
-                dbg() << String::format("DC coefficient too long: %i!", dc_symbol);
-                return {};
-            }
+                    auto& dc_table = context.dc_tables[component.dc_destination_id];
+                    auto& ac_table = context.ac_tables[component.ac_destination_id];
 
-            // Symbol represents the length of this coefficient.
-            auto read_result = read_huffman_bits(context.huffman_stream, dc_symbol);
-            if (!read_result.has_value()) return {};
-            i32 dc_coefficient = read_result.release_value();
+                    auto symbol_read_result = get_next_symbol(context.huffman_stream, dc_table);
+                    if (!symbol_read_result.has_value()) return {};
+                    auto dc_symbol = symbol_read_result.release_value();
+                    if (dc_symbol > 11) {
+                        dbg() << String::format("DC coefficient too long: %i!", dc_symbol);
+                        return {};
+                    }
 
-            // If the symbol says that a coefficient is n bits long, it is guaranteed to be
-            //    n bits long. However, it can be prefixed with zero indicating that it's a
-            //    negative value. In that case, we need to calculate what -ve value that is.
-            if (dc_symbol != 0 && dc_coefficient < (1 << (dc_symbol - 1)))
-                dc_coefficient -= (1 << dc_symbol) - 1;
+                    // Symbol represents the length of this coefficient.
+                    auto read_result = read_huffman_bits(context.huffman_stream, dc_symbol);
+                    if (!read_result.has_value()) return {};
+                    i32 dc_coefficient = read_result.release_value();
 
-            i32* select_component = component.id == 1 ? mcu.y : (component.id == 2 ? mcu.cb : mcu.cr);
-            auto& previous_dc = context.previous_dc_values[component_index];
-            select_component[0] = previous_dc += dc_coefficient;
+                    // If the symbol says that a coefficient is n bits long, it is guaranteed to be
+                    //    n bits long. However, it can be prefixed with zero indicating that it's a
+                    //    negative value. In that case, we need to calculate what -ve value that is.
+                    if (dc_symbol != 0 && dc_coefficient < (1 << (dc_symbol - 1)))
+                        dc_coefficient -= (1 << dc_symbol) - 1;
 
-            // Compute the ac coefficients.
-            for (int j = 1; j < 64; j++) {
-                symbol_read_result = get_next_symbol(context.huffman_stream, ac_table);
-                if (!symbol_read_result.has_value()) return {};
-                auto ac_symbol = symbol_read_result.release_value();
-                if (ac_symbol == 0) {
-                    for (; j < 64; j++)
-                        select_component[zigzag_map[j]] = 0;
-                    continue;
+                    i32* select_component = component.id == 1 ? mcu.y : (component.id == 2 ? mcu.cb : mcu.cr);
+                    auto& previous_dc = context.previous_dc_values[cindex];
+                    select_component[0] = previous_dc += dc_coefficient;
+
+                    // Compute the ac coefficients.
+                    for (int j = 1; j < 64; j++) {
+                        symbol_read_result = get_next_symbol(context.huffman_stream, ac_table);
+                        if (!symbol_read_result.has_value()) return {};
+                        auto ac_symbol = symbol_read_result.release_value();
+                        if (ac_symbol == 0) {
+                            for (; j < 64; j++)
+                                select_component[zigzag_map[j]] = 0;
+                            continue;
+                        }
+
+                        u8 run_length = ac_symbol == 0xF0 ? 16 : ac_symbol >> 4;
+
+                        if (j + run_length >= 64) {
+                            dbg() << String::format("Run-length exceeded boundaries. Cursor: %i, Skipping: %i!", j, run_length);
+                            return {};
+                        }
+
+                        u8 coefficient_length = ac_symbol & 0x0F;
+                        if (coefficient_length > 10) {
+                            dbg() << String::format("AC coefficient too long: %i!", coefficient_length);
+                            return {};
+                        }
+
+                        for (int k = 0; k < run_length; k++)
+                            select_component[zigzag_map[j++]] = 0;
+
+                        read_result = read_huffman_bits(context.huffman_stream, coefficient_length);
+                        if (!read_result.has_value()) return {};
+
+                        i32 ac_coefficient = read_result.release_value();
+                        if (ac_coefficient < (1 << (coefficient_length - 1)))
+                            ac_coefficient -= (1 << coefficient_length) - 1;
+
+                        select_component[zigzag_map[j]] = ac_coefficient;
+                    }
                 }
-
-                u8 run_length = ac_symbol == 0xF0 ? 16 : ac_symbol >> 4;
-
-                if (j + run_length >= 64) {
-                    dbg() << String::format("Run-length exceeded boundaries. Cursor: %i, Skipping: %i!", j, run_length);
-                    return {};
-                }
-
-                u8 coefficient_length = ac_symbol & 0x0F;
-                if (coefficient_length > 10) {
-                    dbg() << String::format("AC coefficient too long: %i!", coefficient_length);
-                    return {};
-                }
-
-                for (int k = 0; k < run_length; k++)
-                    select_component[zigzag_map[j++]] = 0;
-
-                read_result = read_huffman_bits(context.huffman_stream, coefficient_length);
-                if (!read_result.has_value()) return {};
-
-                i32 ac_coefficient = read_result.release_value();
-                if (ac_coefficient < (1 << (coefficient_length - 1)))
-                    ac_coefficient -= (1 << coefficient_length) - 1;
-
-                select_component[zigzag_map[j]] = ac_coefficient;
             }
         }
 
-        return mcu;
+        return true;
     }
 
     Optional<Vector<MCU>> decode_huffman_stream (JPGLoadingContext& context) {
         Vector<MCU> mcus;
-        mcus.ensure_capacity(context.mcu_meta.count);
+        mcus.resize(context.mcu_meta.padded_total);
 
-        dbg() << "Image Width: " << context.frame.width;
-        dbg() << "Image Height: " << context.frame.height;
-        dbg() << "MCUs per row: " << context.mcu_meta.count_per_row;
-        dbg() << "MCUs per column: " << context.mcu_meta.count_per_column;
+        dbg() << "Image width: " << context.frame.width;
+        dbg() << "Image height: " << context.frame.height;
+        dbg() << "MCUs per row: " << context.mcu_meta.hcount;
+        dbg() << "MCUs per column: " << context.mcu_meta.vcount;
 
         // Compute huffman codes for dc and ac tables.
         for (auto& dc_table : context.dc_tables)
@@ -196,33 +211,32 @@ namespace Gfx {
         for (auto& ac_table : context.ac_tables)
             generate_huffman_codes(ac_table);
 
-        // Build MCUs.
-        for (u32 i = 0; i < context.mcu_meta.count; i++) {
-            if (context.dc_reset_interval > 0) {
-                if (i % context.dc_reset_interval == 0) {
-                    context.previous_dc_values[0] = 0;
-                    context.previous_dc_values[1] = 0;
-                    context.previous_dc_values[2] = 0;
+        for (u32 vindex = 0; vindex < context.mcu_meta.vcount; vindex += context.vsample_factor) {
+            for (u32 hindex = 0; hindex < context.mcu_meta.hcount; hindex += context.hsample_factor) {
+                u32 i = vindex * context.mcu_meta.hpadded_count + hindex;
+                if (context.dc_reset_interval > 0) {
+                    if (i % context.dc_reset_interval == 0) {
+                        context.previous_dc_values[0] = 0;
+                        context.previous_dc_values[1] = 0;
+                        context.previous_dc_values[2] = 0;
 
-                    // Advance the huffman stream cursor to the 0th bit of the next byte.
-                    if (context.huffman_stream.byte_offset < context.huffman_stream.stream.size()) {
-                        if (context.huffman_stream.bit_offset > 0) {
-                            context.huffman_stream.bit_offset = 0;
-                            context.huffman_stream.byte_offset++;
+                        // Advance the huffman stream cursor to the 0th bit of the next byte.
+                        if (context.huffman_stream.byte_offset < context.huffman_stream.stream.size()) {
+                            if (context.huffman_stream.bit_offset > 0) {
+                                context.huffman_stream.bit_offset = 0;
+                                context.huffman_stream.byte_offset++;
+                            }
                         }
                     }
                 }
-            }
 
-            auto result = build_mcu(context);
-            if (!result.has_value()) {
-                dbg() << "Failed to build MCU " << i + 1;
-                dbg() << "Huffman stream byte offset " << context.huffman_stream.byte_offset;
-                dbg() << "Huffman stream bit offset " << context.huffman_stream.bit_offset;
-                return {};
+                if (!build_mcus(context, mcus, hindex, vindex)) {
+                    dbg() << "Failed to build MCU " << i + 1;
+                    dbg() << "Huffman stream byte offset " << context.huffman_stream.byte_offset;
+                    dbg() << "Huffman stream bit offset " << context.huffman_stream.bit_offset;
+                    return {};
+                }
             }
-            // FIXME: This will happen a lot. Is the copy here going to make things slow?
-            mcus.append(result.release_value());
         }
 
         return mcus;
@@ -232,9 +246,12 @@ namespace Gfx {
         return (delta + cursor) < bound;
     }
 
-    static inline bool is_valid_marker (Marker marker) {
-        if (marker >= JPG_APPN0 && marker <= JPG_APPNF)
+    static inline bool is_valid_marker (const Marker marker) {
+        if (marker >= JPG_APPN0 && marker <= JPG_APPNF) {
+            if (marker != JPG_APPN0)
+                dbg() << String::format("%04x not supported yet. The decoder may fail!", marker);
             return true;
+        }
         if (marker >= JPG_RESERVED1 && marker <= JPG_RESERVEDD)
             return true;
         if (marker >= JPG_RST0 && marker <= JPG_RST7)
@@ -444,10 +461,28 @@ namespace Gfx {
         return true;
     }
 
+    static inline bool validate_luma_and_modify_context (const Component& luma, JPGLoadingContext& context) {
+        if ((luma.hsample_factor == 1 || luma.hsample_factor == 2) &&
+            (luma.vsample_factor == 1 || luma.vsample_factor == 2)) {
+            context.mcu_meta.hpadded_count += luma.hsample_factor == 1 ? 0 : context.mcu_meta.hcount % 2;
+            context.mcu_meta.vpadded_count += luma.vsample_factor == 1 ? 0 : context.mcu_meta.vcount % 2;
+            // For easy reference to relevant sample factors.
+            context.hsample_factor = luma.hsample_factor;
+            context.vsample_factor = luma.vsample_factor;
+            dbg() << String::format("Horizontal Subsampling Factor: %i", luma.hsample_factor);
+            dbg() << String::format("Vertical Subsampling Factor: %i", luma.vsample_factor);
+            return true;
+        }
+        return false;
+    }
+
     static inline void set_mcu_metadata (JPGLoadingContext& context) {
-        context.mcu_meta.count_per_row = (context.frame.width + 7) / 8;
-        context.mcu_meta.count_per_column = (context.frame.height + 7) / 8;
-        context.mcu_meta.count = context.mcu_meta.count_per_row * context.mcu_meta.count_per_column;
+        context.mcu_meta.hcount = (context.frame.width + 7) / 8;
+        context.mcu_meta.vcount = (context.frame.height + 7) / 8;
+        context.mcu_meta.hpadded_count = context.mcu_meta.hcount;
+        context.mcu_meta.vpadded_count = context.mcu_meta.vcount;
+        context.mcu_meta.total = context.mcu_meta.hcount * context.mcu_meta.vcount;
+        context.mcu_meta.padded_total = context.mcu_meta.hpadded_count * context.mcu_meta.vpadded_count;
     }
 
     static bool read_start_of_frame (BufferStream& stream, JPGLoadingContext& context) {
@@ -488,13 +523,30 @@ namespace Gfx {
 
         for (int i = 0; i < context.component_count; i++) {
             Component& component = context.components[i];
+
             stream >> component.id;
             if (i == 0) context.has_zero_based_ids = component.id == 0;
             component.id += context.has_zero_based_ids ? 1 : 0;
+
             u8 subsample_factors;
             stream >> subsample_factors;
             component.hsample_factor = subsample_factors >> 4;
             component.vsample_factor = subsample_factors & 0x0F;
+
+            if (component.id == 1) {
+                if (!validate_luma_and_modify_context(component, context)) {
+                    dbg() << stream.offset() << ": Unsupported luma subsampling factors: "
+                          << "horizontal: " << component.hsample_factor << ", vertical: " << component.vsample_factor;
+                    return false;
+                }
+            } else {
+                if (component.hsample_factor != 1 || component.vsample_factor != 1) {
+                    dbg() << stream.offset() << ": Unsupported chroma subsampling factors: "
+                          << "horizontal: " << component.hsample_factor << ", vertical: " << component.vsample_factor;
+                    return false;
+                }
+            }
+
             stream >> component.qtable_id;
             if (component.qtable_id > 1) {
                 dbg() << stream.offset() << ": Unsupported quantization table id: "
@@ -610,14 +662,21 @@ namespace Gfx {
     }
 
     void dequantize(JPGLoadingContext& context, Vector<MCU>& mcus) {
-        for (u32 i = 0; i < context.mcu_meta.count; i++) {
-            auto& mcu = mcus[i];
-            for (u32 j = 0; j < context.component_count; j++) {
-                auto& component = context.components[j];
-                const u32* table = component.qtable_id == 0 ? context.luma_table : context.chroma_table;
-                int* mcu_component = j == 0 ? mcu.y : (j == 1 ? mcu.cb : mcu.cr);
-                for (u32 k = 0; k < 64; k++)
-                    mcu_component[k] *= table[k];
+        for (u32 vindex = 0; vindex < context.mcu_meta.vcount; vindex += context.vsample_factor) {
+            for (u32 hindex = 0; hindex < context.mcu_meta.hcount; hindex += context.hsample_factor) {
+                for (u8 cindex = 0; cindex < context.component_count; cindex++) {
+                    auto& component = context.components[cindex];
+                    const u32* table = component.qtable_id == 0 ? context.luma_table : context.chroma_table;
+                    for (u32 sfactor_vi = 0; sfactor_vi < component.vsample_factor; sfactor_vi++) {
+                        for (u32 sfactor_hi = 0; sfactor_hi < component.hsample_factor; sfactor_hi++) {
+                            u32 mcu_index = (vindex + sfactor_vi) * context.mcu_meta.hpadded_count + (sfactor_hi + hindex);
+                            MCU& mcu = mcus[mcu_index];
+                            int* mcu_component = cindex == 0 ? mcu.y : (cindex == 1 ? mcu.cb : mcu.cr);
+                            for (u32 k = 0; k < 64; k++)
+                                mcu_component[k] *= table[k];
+                        }
+                    }
+                }
             }
         }
     }
@@ -639,160 +698,184 @@ namespace Gfx {
         static const float s6 = cos(6.0 / 16.0 * M_PI) / 2.0;
         static const float s7 = cos(7.0 / 16.0 * M_PI) / 2.0;
 
-        for (u32 i = 0; i < context.mcu_meta.count; i++) {
-            auto& mcu = mcus[i];
-            for (int j = 0; j < context.component_count; j++) {
-                i32* component = j == 0 ? mcu.y : (j == 1 ? mcu.cb : mcu.cr);
-                for (u32 k = 0; k < 8; ++k) {
-                    const float g0 = component[0 * 8 + k] * s0;
-                    const float g1 = component[4 * 8 + k] * s4;
-                    const float g2 = component[2 * 8 + k] * s2;
-                    const float g3 = component[6 * 8 + k] * s6;
-                    const float g4 = component[5 * 8 + k] * s5;
-                    const float g5 = component[1 * 8 + k] * s1;
-                    const float g6 = component[7 * 8 + k] * s7;
-                    const float g7 = component[3 * 8 + k] * s3;
+        for (u32 vindex = 0; vindex < context.mcu_meta.vcount; vindex += context.vsample_factor) {
+            for (u32 hindex = 0; hindex < context.mcu_meta.hcount; hindex += context.hsample_factor) {
+                for (u8 cindex = 0; cindex < context.component_count; cindex++) {
+                    auto& component = context.components[cindex];
+                    for (u8 sfactor_vi = 0; sfactor_vi < component.vsample_factor; sfactor_vi++) {
+                        for (u8 sfactor_hi = 0; sfactor_hi < component.hsample_factor; sfactor_hi++) {
+                            u32 mcu_index = (vindex + sfactor_vi) * context.mcu_meta.hpadded_count + (sfactor_hi + hindex);
+                            MCU& mcu = mcus[mcu_index];
+                            i32* mcu_component = cindex == 0 ? mcu.y : (cindex == 1 ? mcu.cb : mcu.cr);
+                            for (u32 k = 0; k < 8; ++k) {
+                                const float g0 = mcu_component[0 * 8 + k] * s0;
+                                const float g1 = mcu_component[4 * 8 + k] * s4;
+                                const float g2 = mcu_component[2 * 8 + k] * s2;
+                                const float g3 = mcu_component[6 * 8 + k] * s6;
+                                const float g4 = mcu_component[5 * 8 + k] * s5;
+                                const float g5 = mcu_component[1 * 8 + k] * s1;
+                                const float g6 = mcu_component[7 * 8 + k] * s7;
+                                const float g7 = mcu_component[3 * 8 + k] * s3;
 
-                    const float f0 = g0;
-                    const float f1 = g1;
-                    const float f2 = g2;
-                    const float f3 = g3;
-                    const float f4 = g4 - g7;
-                    const float f5 = g5 + g6;
-                    const float f6 = g5 - g6;
-                    const float f7 = g4 + g7;
+                                const float f0 = g0;
+                                const float f1 = g1;
+                                const float f2 = g2;
+                                const float f3 = g3;
+                                const float f4 = g4 - g7;
+                                const float f5 = g5 + g6;
+                                const float f6 = g5 - g6;
+                                const float f7 = g4 + g7;
 
-                    const float e0 = f0;
-                    const float e1 = f1;
-                    const float e2 = f2 - f3;
-                    const float e3 = f2 + f3;
-                    const float e4 = f4;
-                    const float e5 = f5 - f7;
-                    const float e6 = f6;
-                    const float e7 = f5 + f7;
-                    const float e8 = f4 + f6;
+                                const float e0 = f0;
+                                const float e1 = f1;
+                                const float e2 = f2 - f3;
+                                const float e3 = f2 + f3;
+                                const float e4 = f4;
+                                const float e5 = f5 - f7;
+                                const float e6 = f6;
+                                const float e7 = f5 + f7;
+                                const float e8 = f4 + f6;
 
-                    const float d0 = e0;
-                    const float d1 = e1;
-                    const float d2 = e2 * m1;
-                    const float d3 = e3;
-                    const float d4 = e4 * m2;
-                    const float d5 = e5 * m3;
-                    const float d6 = e6 * m4;
-                    const float d7 = e7;
-                    const float d8 = e8 * m5;
+                                const float d0 = e0;
+                                const float d1 = e1;
+                                const float d2 = e2 * m1;
+                                const float d3 = e3;
+                                const float d4 = e4 * m2;
+                                const float d5 = e5 * m3;
+                                const float d6 = e6 * m4;
+                                const float d7 = e7;
+                                const float d8 = e8 * m5;
 
-                    const float c0 = d0 + d1;
-                    const float c1 = d0 - d1;
-                    const float c2 = d2 - d3;
-                    const float c3 = d3;
-                    const float c4 = d4 + d8;
-                    const float c5 = d5 + d7;
-                    const float c6 = d6 - d8;
-                    const float c7 = d7;
-                    const float c8 = c5 - c6;
+                                const float c0 = d0 + d1;
+                                const float c1 = d0 - d1;
+                                const float c2 = d2 - d3;
+                                const float c3 = d3;
+                                const float c4 = d4 + d8;
+                                const float c5 = d5 + d7;
+                                const float c6 = d6 - d8;
+                                const float c7 = d7;
+                                const float c8 = c5 - c6;
 
-                    const float b0 = c0 + c3;
-                    const float b1 = c1 + c2;
-                    const float b2 = c1 - c2;
-                    const float b3 = c0 - c3;
-                    const float b4 = c4 - c8;
-                    const float b5 = c8;
-                    const float b6 = c6 - c7;
-                    const float b7 = c7;
+                                const float b0 = c0 + c3;
+                                const float b1 = c1 + c2;
+                                const float b2 = c1 - c2;
+                                const float b3 = c0 - c3;
+                                const float b4 = c4 - c8;
+                                const float b5 = c8;
+                                const float b6 = c6 - c7;
+                                const float b7 = c7;
 
-                    component[0 * 8 + k] = b0 + b7;
-                    component[1 * 8 + k] = b1 + b6;
-                    component[2 * 8 + k] = b2 + b5;
-                    component[3 * 8 + k] = b3 + b4;
-                    component[4 * 8 + k] = b3 - b4;
-                    component[5 * 8 + k] = b2 - b5;
-                    component[6 * 8 + k] = b1 - b6;
-                    component[7 * 8 + k] = b0 - b7;
-                }
-                for (u32 l = 0; l < 8; ++l) {
-                    const float g0 = component[l * 8 + 0] * s0;
-                    const float g1 = component[l * 8 + 4] * s4;
-                    const float g2 = component[l * 8 + 2] * s2;
-                    const float g3 = component[l * 8 + 6] * s6;
-                    const float g4 = component[l * 8 + 5] * s5;
-                    const float g5 = component[l * 8 + 1] * s1;
-                    const float g6 = component[l * 8 + 7] * s7;
-                    const float g7 = component[l * 8 + 3] * s3;
+                                mcu_component[0 * 8 + k] = b0 + b7;
+                                mcu_component[1 * 8 + k] = b1 + b6;
+                                mcu_component[2 * 8 + k] = b2 + b5;
+                                mcu_component[3 * 8 + k] = b3 + b4;
+                                mcu_component[4 * 8 + k] = b3 - b4;
+                                mcu_component[5 * 8 + k] = b2 - b5;
+                                mcu_component[6 * 8 + k] = b1 - b6;
+                                mcu_component[7 * 8 + k] = b0 - b7;
+                            }
+                            for (u32 l = 0; l < 8; ++l) {
+                                const float g0 = mcu_component[l * 8 + 0] * s0;
+                                const float g1 = mcu_component[l * 8 + 4] * s4;
+                                const float g2 = mcu_component[l * 8 + 2] * s2;
+                                const float g3 = mcu_component[l * 8 + 6] * s6;
+                                const float g4 = mcu_component[l * 8 + 5] * s5;
+                                const float g5 = mcu_component[l * 8 + 1] * s1;
+                                const float g6 = mcu_component[l * 8 + 7] * s7;
+                                const float g7 = mcu_component[l * 8 + 3] * s3;
 
-                    const float f0 = g0;
-                    const float f1 = g1;
-                    const float f2 = g2;
-                    const float f3 = g3;
-                    const float f4 = g4 - g7;
-                    const float f5 = g5 + g6;
-                    const float f6 = g5 - g6;
-                    const float f7 = g4 + g7;
+                                const float f0 = g0;
+                                const float f1 = g1;
+                                const float f2 = g2;
+                                const float f3 = g3;
+                                const float f4 = g4 - g7;
+                                const float f5 = g5 + g6;
+                                const float f6 = g5 - g6;
+                                const float f7 = g4 + g7;
 
-                    const float e0 = f0;
-                    const float e1 = f1;
-                    const float e2 = f2 - f3;
-                    const float e3 = f2 + f3;
-                    const float e4 = f4;
-                    const float e5 = f5 - f7;
-                    const float e6 = f6;
-                    const float e7 = f5 + f7;
-                    const float e8 = f4 + f6;
+                                const float e0 = f0;
+                                const float e1 = f1;
+                                const float e2 = f2 - f3;
+                                const float e3 = f2 + f3;
+                                const float e4 = f4;
+                                const float e5 = f5 - f7;
+                                const float e6 = f6;
+                                const float e7 = f5 + f7;
+                                const float e8 = f4 + f6;
 
-                    const float d0 = e0;
-                    const float d1 = e1;
-                    const float d2 = e2 * m1;
-                    const float d3 = e3;
-                    const float d4 = e4 * m2;
-                    const float d5 = e5 * m3;
-                    const float d6 = e6 * m4;
-                    const float d7 = e7;
-                    const float d8 = e8 * m5;
+                                const float d0 = e0;
+                                const float d1 = e1;
+                                const float d2 = e2 * m1;
+                                const float d3 = e3;
+                                const float d4 = e4 * m2;
+                                const float d5 = e5 * m3;
+                                const float d6 = e6 * m4;
+                                const float d7 = e7;
+                                const float d8 = e8 * m5;
 
-                    const float c0 = d0 + d1;
-                    const float c1 = d0 - d1;
-                    const float c2 = d2 - d3;
-                    const float c3 = d3;
-                    const float c4 = d4 + d8;
-                    const float c5 = d5 + d7;
-                    const float c6 = d6 - d8;
-                    const float c7 = d7;
-                    const float c8 = c5 - c6;
+                                const float c0 = d0 + d1;
+                                const float c1 = d0 - d1;
+                                const float c2 = d2 - d3;
+                                const float c3 = d3;
+                                const float c4 = d4 + d8;
+                                const float c5 = d5 + d7;
+                                const float c6 = d6 - d8;
+                                const float c7 = d7;
+                                const float c8 = c5 - c6;
 
-                    const float b0 = c0 + c3;
-                    const float b1 = c1 + c2;
-                    const float b2 = c1 - c2;
-                    const float b3 = c0 - c3;
-                    const float b4 = c4 - c8;
-                    const float b5 = c8;
-                    const float b6 = c6 - c7;
-                    const float b7 = c7;
+                                const float b0 = c0 + c3;
+                                const float b1 = c1 + c2;
+                                const float b2 = c1 - c2;
+                                const float b3 = c0 - c3;
+                                const float b4 = c4 - c8;
+                                const float b5 = c8;
+                                const float b6 = c6 - c7;
+                                const float b7 = c7;
 
-                    component[l * 8 + 0] = b0 + b7;
-                    component[l * 8 + 1] = b1 + b6;
-                    component[l * 8 + 2] = b2 + b5;
-                    component[l * 8 + 3] = b3 + b4;
-                    component[l * 8 + 4] = b3 - b4;
-                    component[l * 8 + 5] = b2 - b5;
-                    component[l * 8 + 6] = b1 - b6;
-                    component[l * 8 + 7] = b0 - b7;
+                                mcu_component[l * 8 + 0] = b0 + b7;
+                                mcu_component[l * 8 + 1] = b1 + b6;
+                                mcu_component[l * 8 + 2] = b2 + b5;
+                                mcu_component[l * 8 + 3] = b3 + b4;
+                                mcu_component[l * 8 + 4] = b3 - b4;
+                                mcu_component[l * 8 + 5] = b2 - b5;
+                                mcu_component[l * 8 + 6] = b1 - b6;
+                                mcu_component[l * 8 + 7] = b0 - b7;
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
     void ycbcr_to_rgb(const JPGLoadingContext& context, Vector<MCU>& mcus) {
-        for (u32 i = 0; i < context.mcu_meta.count; i++) {
-            i32* y = mcus[i].y;
-            i32* cb = mcus[i].cb;
-            i32* cr = mcus[i].cr;
-            for (u32 j = 0; j < 64; j++) {
-                int r = y[j] + 1.402 * cr[j] + 128;
-                int g = y[j] - 0.344f * cb[j] - 0.714f * cr[j] + 128;
-                int b = y[j] + 1.772 * cb[j] + 128;
-                y[j]  = r < 0 ? 0 : (r > 255 ? 255 : r);
-                cb[j] = g < 0 ? 0 : (g > 255 ? 255 : g);
-                cr[j] = b < 0 ? 0 : (b > 255 ? 255 : b);
+        for (u32 vindex = 0; vindex < context.mcu_meta.vcount; vindex += context.vsample_factor) {
+            for (u32 hindex = 0; hindex < context.mcu_meta.hcount; hindex += context.hsample_factor) {
+                const u32 chroma_mcu_index = vindex * context.mcu_meta.hpadded_count + hindex;
+                const MCU& chroma = mcus[chroma_mcu_index];
+                // Overflows are intentional.
+                for (u8 sfactor_vi = context.vsample_factor - 1; sfactor_vi < context.vsample_factor; --sfactor_vi) {
+                    for (u8 sfactor_hi = context.hsample_factor - 1; sfactor_hi < context.hsample_factor; --sfactor_hi) {
+                        u32 mcu_index = (vindex + sfactor_vi) * context.mcu_meta.hpadded_count + (hindex + sfactor_hi);
+                        i32* y = mcus[mcu_index].y;
+                        i32* cb = mcus[mcu_index].cb;
+                        i32* cr = mcus[mcu_index].cr;
+                        for (u8 i = 7; i < 8; --i) {
+                            for (u8 j = 7; j < 8; --j) {
+                                const u8 pixel = i * 8 + j;
+                                const u32 chroma_pxrow = (i / context.vsample_factor) + 4 * sfactor_vi;
+                                const u32 chroma_pxcol = (j / context.hsample_factor) + 4 * sfactor_hi;
+                                const u32 chroma_pixel = chroma_pxrow * 8 + chroma_pxcol;
+                                int r = y[pixel] + 1.402 * chroma.cr[chroma_pixel] + 128;
+                                int g = y[pixel] - 0.344f * chroma.cb[chroma_pixel] - 0.714f * chroma.cr[chroma_pixel] + 128;
+                                int b = y[pixel] + 1.772 * chroma.cb[chroma_pixel] + 128;
+                                y[pixel]  = r < 0 ? 0 : (r > 255 ? 255 : r);
+                                cb[pixel] = g < 0 ? 0 : (g > 255 ? 255 : g);
+                                cr[pixel] = b < 0 ? 0 : (b > 255 ? 255 : b);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -805,7 +888,7 @@ namespace Gfx {
             const u32 pixel_row = y % 8;
             for (u32 x = 0; x < context.frame.width; x++) {
                 const u32 mcu_column = x / 8;
-                auto& mcu = mcus[mcu_row * context.mcu_meta.count_per_row + mcu_column];
+                auto& mcu = mcus[mcu_row * context.mcu_meta.hpadded_count + mcu_column];
                 const u32 pixel_column = x % 8;
                 const u32 pixel_index = pixel_row * 8 + pixel_column;
                 const Color color {(u8)mcu.y[pixel_index], (u8)mcu.cb[pixel_index], (u8)mcu.cr[pixel_index]};
