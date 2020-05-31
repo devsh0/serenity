@@ -100,7 +100,10 @@ namespace Gfx {
             }
         }
 
-        ASSERT_NOT_REACHED();
+        // Let's not crash the browser now...rather just close all operations gracefully.
+        // ASSERT_NOT_REACHED();
+        dbg() << "If you're seeing this...the jpeg decoder needs to support more kinds of JPEGs!";
+        return {};
     }
 
     /*
@@ -130,16 +133,16 @@ namespace Gfx {
                     auto& ac_table = context.ac_tables[component.ac_destination_id];
 
                     auto symbol_read_result = get_next_symbol(context.huffman_stream, dc_table);
-                    if (!symbol_read_result.has_value()) return {};
+                    if (!symbol_read_result.has_value()) return false;
                     auto dc_symbol = symbol_read_result.release_value();
                     if (dc_symbol > 11) {
                         dbg() << String::format("DC coefficient too long: %i!", dc_symbol);
-                        return {};
+                        return false;
                     }
 
                     // Symbol represents the length of this coefficient.
                     auto read_result = read_huffman_bits(context.huffman_stream, dc_symbol);
-                    if (!read_result.has_value()) return {};
+                    if (!read_result.has_value()) return false;
                     i32 dc_coefficient = read_result.release_value();
 
                     // If the symbol says that a coefficient is n bits long, it is guaranteed to be
@@ -155,7 +158,7 @@ namespace Gfx {
                     // Compute the ac coefficients.
                     for (int j = 1; j < 64; j++) {
                         symbol_read_result = get_next_symbol(context.huffman_stream, ac_table);
-                        if (!symbol_read_result.has_value()) return {};
+                        if (!symbol_read_result.has_value()) return false;
                         auto ac_symbol = symbol_read_result.release_value();
                         if (ac_symbol == 0) {
                             for (; j < 64; j++)
@@ -167,20 +170,20 @@ namespace Gfx {
 
                         if (j + run_length >= 64) {
                             dbg() << String::format("Run-length exceeded boundaries. Cursor: %i, Skipping: %i!", j, run_length);
-                            return {};
+                            return false;
                         }
 
                         u8 coefficient_length = ac_symbol & 0x0F;
                         if (coefficient_length > 10) {
                             dbg() << String::format("AC coefficient too long: %i!", coefficient_length);
-                            return {};
+                            return false;
                         }
 
                         for (int k = 0; k < run_length; k++)
                             select_component[zigzag_map[j++]] = 0;
 
                         read_result = read_huffman_bits(context.huffman_stream, coefficient_length);
-                        if (!read_result.has_value()) return {};
+                        if (!read_result.has_value()) return false;
 
                         i32 ac_coefficient = read_result.release_value();
                         if (ac_coefficient < (1 << (coefficient_length - 1)))
@@ -466,6 +469,7 @@ namespace Gfx {
             (luma.vsample_factor == 1 || luma.vsample_factor == 2)) {
             context.mcu_meta.hpadded_count += luma.hsample_factor == 1 ? 0 : context.mcu_meta.hcount % 2;
             context.mcu_meta.vpadded_count += luma.vsample_factor == 1 ? 0 : context.mcu_meta.vcount % 2;
+            context.mcu_meta.padded_total = context.mcu_meta.hpadded_count * context.mcu_meta.vpadded_count;
             // For easy reference to relevant sample factors.
             context.hsample_factor = luma.hsample_factor;
             context.vsample_factor = luma.vsample_factor;
@@ -482,7 +486,6 @@ namespace Gfx {
         context.mcu_meta.hpadded_count = context.mcu_meta.hcount;
         context.mcu_meta.vpadded_count = context.mcu_meta.vcount;
         context.mcu_meta.total = context.mcu_meta.hcount * context.mcu_meta.vcount;
-        context.mcu_meta.padded_total = context.mcu_meta.hpadded_count * context.mcu_meta.vpadded_count;
     }
 
     static bool read_start_of_frame (BufferStream& stream, JPGLoadingContext& context) {
