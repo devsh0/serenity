@@ -380,16 +380,16 @@ namespace Gfx {
             component->ac_destination_id = table_ids & 0x0F;
         }
 
-        u8 start_of_selection;
-        stream >> start_of_selection;
-        u8 end_of_selection;
-        stream >> end_of_selection;
+        u8 spectral_selection_start;
+        stream >> spectral_selection_start;
+        u8 spectral_selection_end;
+        stream >> spectral_selection_end;
         u8 successive_approximation;
         stream >> successive_approximation;
         // The three values should be fixed for baseline JPEGs utilizing sequential DCT.
-        if (start_of_selection != 0 || end_of_selection != 63 || successive_approximation != 0) {
-            dbg() << stream.offset() << ": ERROR! Start of Selection: " << start_of_selection
-                  << ", End of Selection: " << end_of_selection
+        if (spectral_selection_start != 0 || spectral_selection_end != 63 || successive_approximation != 0) {
+            dbg() << stream.offset() << ": ERROR! Start of Selection: " << spectral_selection_start
+                  << ", End of Selection: " << spectral_selection_end
                   << ", Successive Approximation: " << successive_approximation << "!";
             return false;
         }
@@ -869,9 +869,9 @@ namespace Gfx {
                                 const u32 chroma_pxrow = (i / context.vsample_factor) + 4 * sfactor_vi;
                                 const u32 chroma_pxcol = (j / context.hsample_factor) + 4 * sfactor_hi;
                                 const u32 chroma_pixel = chroma_pxrow * 8 + chroma_pxcol;
-                                int r = y[pixel] + 1.402 * chroma.cr[chroma_pixel] + 128;
+                                int r = y[pixel] + 1.402f * chroma.cr[chroma_pixel] + 128;
                                 int g = y[pixel] - 0.344f * chroma.cb[chroma_pixel] - 0.714f * chroma.cr[chroma_pixel] + 128;
-                                int b = y[pixel] + 1.772 * chroma.cb[chroma_pixel] + 128;
+                                int b = y[pixel] + 1.772f * chroma.cb[chroma_pixel] + 128;
                                 y[pixel]  = r < 0 ? 0 : (r > 255 ? 255 : r);
                                 cb[pixel] = g < 0 ? 0 : (g > 255 ? 255 : g);
                                 cr[pixel] = b < 0 ? 0 : (b > 255 ? 255 : b);
