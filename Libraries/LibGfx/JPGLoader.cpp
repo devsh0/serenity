@@ -64,7 +64,7 @@ namespace Gfx {
     }
 
     Optional<size_t> read_huffman_bits (HuffmanStreamState& hstream, size_t count = 1) {
-        if (count > (8 * sizeof(int))) {
+        if (count > (8 * sizeof(size_t))) {
             dbg() << String::format("Can't read %i bits at once!", count);
             return {};
         }
@@ -156,7 +156,7 @@ namespace Gfx {
                     select_component[0] = previous_dc += dc_coefficient;
 
                     // Compute the ac coefficients.
-                    for (int j = 1; j < 64; j++) {
+                    for (int j = 1; j < 64;) {
                         symbol_read_result = get_next_symbol(context.huffman_stream, ac_table);
                         if (!symbol_read_result.has_value()) return false;
                         auto ac_symbol = symbol_read_result.release_value();
@@ -182,14 +182,15 @@ namespace Gfx {
                         for (int k = 0; k < run_length; k++)
                             select_component[zigzag_map[j++]] = 0;
 
-                        read_result = read_huffman_bits(context.huffman_stream, coefficient_length);
-                        if (!read_result.has_value()) return false;
+                        if (coefficient_length != 0) {
+                            read_result = read_huffman_bits(context.huffman_stream, coefficient_length);
+                            if (!read_result.has_value()) return false;
+                            i32 ac_coefficient = read_result.release_value();
+                            if (ac_coefficient < (1 << (coefficient_length - 1)))
+                                ac_coefficient -= (1 << coefficient_length) - 1;
 
-                        i32 ac_coefficient = read_result.release_value();
-                        if (ac_coefficient < (1 << (coefficient_length - 1)))
-                            ac_coefficient -= (1 << coefficient_length) - 1;
-
-                        select_component[zigzag_map[j]] = ac_coefficient;
+                            select_component[zigzag_map[j++]] = ac_coefficient;
+                        }
                     }
                 }
             }
@@ -297,44 +298,6 @@ namespace Gfx {
         } while (next == 0xFF);
         marker = 0xFF00 | (u16) next;
         return is_valid_marker(marker) ? marker : JPG_INVALID;
-    }
-
-    static bool scan_huffman_stream (BufferStream& stream, JPGLoadingContext& context) {
-        u8 last_byte;
-        u8 current_byte;
-        stream >> current_byte;
-
-        for (;;) {
-            last_byte = current_byte;
-            stream >> current_byte;
-            if (stream.handle_read_failure()) {
-                dbg() << stream.offset() << ": EOI not found!";
-                return false;
-            }
-
-            if (last_byte == 0xFF) {
-                if (current_byte == 0xFF)
-                    continue;
-                if (current_byte == 0x00) {
-                    stream >> current_byte;
-                    context.huffman_stream.stream.append(last_byte);
-                    continue;
-                }
-                Marker marker = 0xFF00 | current_byte;
-                if (marker == JPG_EOI)
-                    return true;
-                if (marker >= JPG_RST0 && marker <= JPG_RST7) {
-                    stream >> current_byte;
-                    continue;
-                }
-                dbg() << stream.offset() << String::format(": Invalid marker: %x!", marker);
-                return false;
-            } else {
-                context.huffman_stream.stream.append(last_byte);
-            }
-        }
-
-        ASSERT_NOT_REACHED();
     }
 
     static bool read_start_of_scan (BufferStream& stream, JPGLoadingContext& context) {
@@ -609,61 +572,6 @@ namespace Gfx {
         return !stream.handle_read_failure();
     }
 
-    static bool parse_header (BufferStream& stream, JPGLoadingContext& context) {
-        auto marker = read_marker_at_cursor(stream);
-        if (stream.handle_read_failure())
-            return false;
-        if (marker != JPG_SOI) {
-            dbg() << stream.offset() << String::format(": SOI not found: %x!", marker);
-            return false;
-        }
-        for (;;) {
-            marker = read_marker_at_cursor(stream);
-            switch (marker) {
-                case JPG_INVALID:
-                case JPG_RST0:
-                case JPG_RST1:
-                case JPG_RST2:
-                case JPG_RST3:
-                case JPG_RST4:
-                case JPG_RST5:
-                case JPG_RST6:
-                case JPG_RST7:
-                case JPG_SOI:
-                case JPG_EOI:
-                    dbg() << stream.offset() << String::format(": Unexpected marker %x!", marker);
-                    return false;
-                case JPG_SOF0:
-                    if (!read_start_of_frame(stream, context))
-                        return false;
-                    context.state = JPGLoadingContext::FrameDecoded;
-                    break;
-                case JPG_DQT:
-                    if (!read_quantization_table(stream, context))
-                        return false;
-                    break;
-                case JPG_RST:
-                    if (!read_reset_marker(stream, context))
-                        return false;
-                    break;
-                case JPG_DHT:
-                    if (!read_huffman_table(stream, context))
-                        return false;
-                    break;
-                case JPG_SOS:
-                    return read_start_of_scan(stream, context);
-                default:
-                    if (!skip_marker_with_length(stream)) {
-                        dbg() << stream.offset() << String::format(": Error skipping marker: %x!", marker);
-                        return false;
-                    }
-                    break;
-            }
-        }
-
-        ASSERT_NOT_REACHED();
-    }
-
     void dequantize(JPGLoadingContext& context, Vector<MCU>& mcus) {
         for (u32 vindex = 0; vindex < context.mcu_meta.vcount; vindex += context.vsample_factor) {
             for (u32 hindex = 0; hindex < context.mcu_meta.hcount; hindex += context.hsample_factor) {
@@ -898,6 +806,99 @@ namespace Gfx {
                 context.bitmap->set_pixel(x, y, color);
             }
         }
+    }
+
+    static bool parse_header (BufferStream& stream, JPGLoadingContext& context) {
+        auto marker = read_marker_at_cursor(stream);
+        if (stream.handle_read_failure())
+            return false;
+        if (marker != JPG_SOI) {
+            dbg() << stream.offset() << String::format(": SOI not found: %x!", marker);
+            return false;
+        }
+        for (;;) {
+            marker = read_marker_at_cursor(stream);
+            switch (marker) {
+                case JPG_INVALID:
+                case JPG_RST0:
+                case JPG_RST1:
+                case JPG_RST2:
+                case JPG_RST3:
+                case JPG_RST4:
+                case JPG_RST5:
+                case JPG_RST6:
+                case JPG_RST7:
+                case JPG_SOI:
+                case JPG_EOI:
+                    dbg() << stream.offset() << String::format(": Unexpected marker %x!", marker);
+                    return false;
+                case JPG_SOF0:
+                    if (!read_start_of_frame(stream, context))
+                        return false;
+                    context.state = JPGLoadingContext::FrameDecoded;
+                    break;
+                case JPG_DQT:
+                    if (!read_quantization_table(stream, context))
+                        return false;
+                    break;
+                case JPG_RST:
+                    if (!read_reset_marker(stream, context))
+                        return false;
+                    break;
+                case JPG_DHT:
+                    if (!read_huffman_table(stream, context))
+                        return false;
+                    break;
+                case JPG_SOS:
+                    return read_start_of_scan(stream, context);
+                default:
+                    if (!skip_marker_with_length(stream)) {
+                        dbg() << stream.offset() << String::format(": Error skipping marker: %x!", marker);
+                        return false;
+                    }
+                    break;
+            }
+        }
+
+        ASSERT_NOT_REACHED();
+    }
+    
+    static bool scan_huffman_stream (BufferStream& stream, JPGLoadingContext& context) {
+        u8 last_byte;
+        u8 current_byte;
+        stream >> current_byte;
+
+        for (;;) {
+            last_byte = current_byte;
+            stream >> current_byte;
+            if (stream.handle_read_failure()) {
+                dbg() << stream.offset() << ": EOI not found!";
+                return false;
+            }
+
+            if (last_byte == 0xFF) {
+                if (current_byte == 0xFF)
+                    continue;
+                if (current_byte == 0x00) {
+                    stream >> current_byte;
+                    context.huffman_stream.stream.append(last_byte);
+                    continue;
+                }
+                Marker marker = 0xFF00 | current_byte;
+                if (marker == JPG_EOI)
+                    return true;
+                if (marker >= JPG_RST0 && marker <= JPG_RST7) {
+                    stream >> current_byte;
+                    continue;
+                }
+                dbg() << stream.offset() << String::format(": Invalid marker: %x!", marker);
+                return false;
+            } else {
+                context.huffman_stream.stream.append(last_byte);
+            }
+        }
+
+        ASSERT_NOT_REACHED();
     }
 
     static bool load_jpg_impl (JPGLoadingContext& context) {
