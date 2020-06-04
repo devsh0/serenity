@@ -586,7 +586,7 @@ namespace Gfx {
                 if (element_unit_hint == 0) {
                     u8 tmp;
                     stream >> tmp;
-                    table[i] = tmp;
+                    table[zigzag_map[i]] = tmp;
                 } else
                     table[zigzag_map[i]] = read_endian_swapped_word(stream);
             }
