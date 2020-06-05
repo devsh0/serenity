@@ -34,6 +34,7 @@
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/JPGLoader.h>
 #include <Libraries/LibM/math.h>
+#include <AK/HashMap.h>
 
 namespace Gfx {
 
@@ -41,7 +42,7 @@ namespace Gfx {
     RefPtr<Gfx::Bitmap> load_jpg (const StringView& path);
     RefPtr<Gfx::Bitmap> load_jpg_from_memory (const u8*, size_t);
 
-    static const u8 zigzag_map[64]{
+    static const u8 zigzag_map[64] {
         0, 1, 8, 16, 9, 2, 3, 10,
         17, 24, 32, 25, 18, 11, 4, 5,
         12, 19, 26, 33, 40, 48, 41, 34,
@@ -75,7 +76,7 @@ namespace Gfx {
                 return {};
             }
             u8 current_byte = hstream.stream[hstream.byte_offset];
-            u8 current_bit = 1u & (u32)(current_byte >> (7 - hstream.bit_offset)); // MSB first.
+            u8 current_bit = 1u & (u32) (current_byte >> (7 - hstream.bit_offset)); // MSB first.
             hstream.bit_offset++;
             value = (value << 1) | (size_t) current_bit;
             if (hstream.bit_offset == 8) {
@@ -106,9 +107,69 @@ namespace Gfx {
         return {};
     }
 
+    Optional<i32> decode_dc (const HuffmanTableSpec& table_spec, JPGLoadingContext& context) {
+        auto symbol_or_error = get_next_symbol(context.huffman_stream, table_spec);
+        if (!symbol_or_error.has_value()) return {};
+
+        // For DC coefficients, symbol encodes the length of the coefficient.
+        auto dc_length = symbol_or_error.release_value();
+        if (dc_length > 11) {
+            dbg() << String::format("DC coefficient too long: %i!", dc_length);
+            return {};
+        }
+
+        auto coeff_or_error = read_huffman_bits(context.huffman_stream, dc_length);
+        if (!coeff_or_error.has_value()) return {};
+
+        // DC coefficients are encoded as the difference between previous and current DC values.
+        i32 dc_diff = coeff_or_error.release_value();
+
+        // If MSB in diff is 0, the difference is -ve. Otherwise +ve.
+        if (dc_length != 0 && dc_diff < (1 << (dc_length - 1)))
+            dc_diff -= (1 << dc_length) - 1;
+
+        return dc_diff;
+    }
+
+    // output["symbol"] = Symbol, output["run_length"] = Run Length,
+    // output["coeff_length"] = Coefficient Length, output["coeff"] = Coefficient.
+    Optional<HashMap<String, i32>> decode_ac (const HuffmanTableSpec& table_spec, JPGLoadingContext& context) {
+        HashMap<String, i32> output;
+        auto symbol_or_error = get_next_symbol(context.huffman_stream, table_spec);
+        if (!symbol_or_error.has_value()) return {};
+
+        // AC symbols encode 2 pieces of information, the high 4 bits represent
+        // number of zeroes to be stuffed before reading the coefficient. Low 4
+        // bits represent the magnitude of the coefficient.
+        auto ac_symbol = symbol_or_error.release_value();
+        output.set("symbol", ac_symbol);
+        if (ac_symbol == 0) return output;
+
+        // ac_symbol = 0xF0 means we need to skip 16 zeroes.
+        output.set("run_length", ac_symbol == 0xF0 ? 16 : ac_symbol >> 4);
+
+        u8 coeff_length = ac_symbol & 0x0F;
+        if (coeff_length > 10) {
+            dbg() << String::format("AC coefficient too long: %i!", coeff_length);
+            return {};
+        }
+        output.set("coeff_length", coeff_length);
+
+        if (coeff_length > 0) {
+            auto coeff_or_error = read_huffman_bits(context.huffman_stream, coeff_length);
+            if (!coeff_or_error.has_value()) return {};
+            i32 ac_coefficient = coeff_or_error.release_value();
+            if (ac_coefficient < (1 << (coeff_length - 1)))
+                ac_coefficient -= (1 << coeff_length) - 1;
+            output.set("coeff", ac_coefficient);
+        }
+
+        return output;
+    }
+
     /*
      * Build the macroblocks possible by reading single (MCU) subsampled pair of CbCr.
-     * Depending on the sampling factors, we may not see triples of y, cb, cr in that
+     * Depending on the sampling factors, we may not see triples of Y, Cb, Cr in that
      * order. If sample factors differ from one, we'll read more than one block of y-
      * coefficients before we get to read a cb-cr block.
      *
@@ -128,52 +189,26 @@ namespace Gfx {
                 for (u8 hfactor_i = 0; hfactor_i < component.hsample_factor; hfactor_i++) {
                     u32 mb_index = (vcursor + vfactor_i) * context.mblock_meta.hpadded_count + (hfactor_i + hcursor);
                     Macroblock& block = macroblocks[mb_index];
-
-                    auto& dc_table = context.dc_tables[component.dc_destination_id];
-                    auto& ac_table = context.ac_tables[component.ac_destination_id];
-
-                    auto symbol_or_error = get_next_symbol(context.huffman_stream, dc_table);
-                    if (!symbol_or_error.has_value()) return false;
-
-                    // For DC coefficients, symbol encodes the length of the coefficient.
-                    auto dc_length = symbol_or_error.release_value();
-                    if (dc_length > 11) {
-                        dbg() << String::format("DC coefficient too long: %i!", dc_length);
-                        return false;
-                    }
-
-                    auto coeff_or_error = read_huffman_bits(context.huffman_stream, dc_length);
-                    if (!coeff_or_error.has_value()) return false;
-
-                    // DC coefficients are encoded as the difference between previous and current DC values.
-                    i32 dc_diff = coeff_or_error.release_value();
-
-                    // If MSB in diff is 0, the difference is -ve. Otherwise +ve.
-                    if (dc_length != 0 && dc_diff < (1 << (dc_length - 1)))
-                        dc_diff -= (1 << dc_length) - 1;
-
                     i32* select_component = component.id == 1 ? block.y : (component.id == 2 ? block.cb : block.cr);
+
+                    auto dc_diff_or_error = decode_dc(context.dc_tables[component.dc_destination_id], context);
+                    if (!dc_diff_or_error.has_value()) return false;
                     auto& previous_dc = context.previous_dc_values[cindex];
-                    select_component[0] = previous_dc += dc_diff;
+                    select_component[0] = previous_dc += dc_diff_or_error.value();
 
                     // Compute the AC coefficients.
                     for (int j = 1; j < 64;) {
-                        symbol_or_error = get_next_symbol(context.huffman_stream, ac_table);
-                        if (!symbol_or_error.has_value()) return false;
+                        auto ac_or_error = decode_ac(context.ac_tables[component.ac_destination_id], context);
+                        if (!ac_or_error.has_value()) return false;
+                        auto output = ac_or_error.release_value();
 
-                        // AC symbols encode 2 pieces of information, the high 4 bits represent
-                        // number of zeroes to be stuffed before reading the coefficient. Low 4
-                        // bits represent the magnitude of the coefficient.
-                        auto ac_symbol = symbol_or_error.release_value();
-                        if (ac_symbol == 0) {
+                        if (output.get("symbol").value() == 0) {
                             for (; j < 64; j++)
                                 select_component[zigzag_map[j]] = 0;
                             continue;
                         }
 
-                        // ac_symbol = 0xF0 means we need to skip 16 zeroes.
-                        u8 run_length = ac_symbol == 0xF0 ? 16 : ac_symbol >> 4;
-
+                        auto run_length = output.get("run_length").release_value();
                         if (j + run_length >= 64) {
                             dbg() << String::format("Run-length exceeded boundaries. Cursor: %i, Skipping: %i!", j, run_length);
                             return false;
@@ -182,22 +217,9 @@ namespace Gfx {
                         for (int k = 0; k < run_length; k++)
                             select_component[zigzag_map[j++]] = 0;
 
-                        u8 coeff_length = ac_symbol & 0x0F;
-                        if (coeff_length > 10) {
-                            dbg() << String::format("AC coefficient too long: %i!", coeff_length);
-                            return false;
-                        }
-
                         // If coeff_length == 0, we need to read another symbol to decode the coefficient.
-                        if (coeff_length != 0) {
-                            coeff_or_error = read_huffman_bits(context.huffman_stream, coeff_length);
-                            if (!coeff_or_error.has_value()) return false;
-                            i32 ac_coefficient = coeff_or_error.release_value();
-                            if (ac_coefficient < (1 << (coeff_length - 1)))
-                                ac_coefficient -= (1 << coeff_length) - 1;
-
-                            select_component[zigzag_map[j++]] = ac_coefficient;
-                        }
+                        if (output.get("coeff_length").value() != 0)
+                            select_component[zigzag_map[j++]] = output.get("coeff").release_value();
                     }
                 }
             }
@@ -214,7 +236,7 @@ namespace Gfx {
         dbg() << "Image height: " << context.frame.height;
         dbg() << "Macroblocks in a row: " << context.mblock_meta.hpadded_count;
         dbg() << "Macroblocks in a column: " << context.mblock_meta.vpadded_count;
-        
+
 
         // Compute huffman codes for DC and AC tables.
         for (auto& dc_table : context.dc_tables)
@@ -280,6 +302,7 @@ namespace Gfx {
             case JPG_DQT:
             case JPG_RST:
             case JPG_SOF0:
+            case JPG_SOF2:
             case JPG_SOI:
             case JPG_SOS:
                 return true;
@@ -289,7 +312,7 @@ namespace Gfx {
     }
 
     static inline u16 read_endian_swapped_word (BufferStream& stream) {
-        u16 temp{0};
+        u16 temp = 0;
         stream >> temp;
         return (temp >> 8) | (temp << 8);
     }
@@ -312,6 +335,55 @@ namespace Gfx {
         return is_valid_marker(marker) ? marker : JPG_INVALID;
     }
 
+    void inline print_scan_spec (const JPGLoadingContext& context) {
+        dbg() << "Start of Selection: " << context.scan_spec.spectral_start << ", " <<
+              "End of Selection: " << context.scan_spec.spectral_end << ", " <<
+              "Successive Hi: " << context.scan_spec.approx_hi << ", " <<
+              "Successive Lo: " << context.scan_spec.approx_lo << "!";
+    }
+
+    static bool read_and_validate_scan_spec (BufferStream& stream, JPGLoadingContext& context) {
+        stream >> context.scan_spec.spectral_start;
+        stream >> context.scan_spec.spectral_end;
+        u8 successive_approx;
+        stream >> successive_approx;
+        context.scan_spec.approx_hi = successive_approx >> 4;
+        context.scan_spec.approx_lo = successive_approx & 0x0F;
+
+        print_scan_spec(context);
+
+        if (context.is_progressive) {
+            // TODO: If 4 high order bits of successive_approx is 0, this is the first scan for the band.
+
+            if ((context.scan_spec.spectral_start == 0 || context.scan_spec.spectral_end == 0) &&
+                (context.scan_spec.spectral_start != context.scan_spec.spectral_end))
+                return false;
+
+            if (context.scan_spec.spectral_start > context.scan_spec.spectral_end)
+                return false;
+
+            // TODO: If the spectral selection start is not 0, the scan may only contain one component.
+
+            if (context.scan_spec.spectral_end > 63)
+                return false;
+
+            if (context.scan_spec.approx_lo > 13)
+                return false;
+
+            if (context.scan_spec.approx_hi != 0 && context.scan_spec.approx_hi != context.scan_spec.approx_lo + 1)
+                return false;
+
+            if (context.scan_spec.spectral_start == 0) {
+                dbg() << "First DC scan";
+                context.scan_spec.type = ScanSpec::ScanType::DC_FIRST;
+            }
+
+            return true;
+        }
+
+        return context.scan_spec.spectral_start == 0 && context.scan_spec.spectral_end == 63 && successive_approx == 0;
+    }
+
     static bool read_start_of_scan (BufferStream& stream, JPGLoadingContext& context) {
         if (context.state < JPGLoadingContext::State::FrameDecoded) {
             dbg() << stream.offset() << ": SOS found before reading a SOF!";
@@ -326,11 +398,12 @@ namespace Gfx {
             return false;
         u8 component_count;
         stream >> component_count;
-        if (component_count != context.component_count) {
-            dbg() << stream.offset()
-                  << String::format(": Unsupported number of components: %i!", component_count);
+        if (component_count > context.component_count) {
+            dbg() << stream.offset() << String::format(": Unsupported number of components: %i!", component_count);
             return false;
         }
+
+        dbg() << "Component in this scan: " << component_count;
 
         for (int i = 0; i < component_count; i++) {
             ComponentSpec* component = nullptr;
@@ -355,20 +428,7 @@ namespace Gfx {
             component->ac_destination_id = table_ids & 0x0F;
         }
 
-        u8 spectral_selection_start;
-        stream >> spectral_selection_start;
-        u8 spectral_selection_end;
-        stream >> spectral_selection_end;
-        u8 successive_approximation;
-        stream >> successive_approximation;
-        // The three values should be fixed for baseline JPEGs utilizing sequential DCT.
-        if (spectral_selection_start != 0 || spectral_selection_end != 63 || successive_approximation != 0) {
-            dbg() << stream.offset() << ": ERROR! Start of Selection: " << spectral_selection_start
-                  << ", End of Selection: " << spectral_selection_end
-                  << ", Successive Approximation: " << successive_approximation << "!";
-            return false;
-        }
-        return true;
+        return read_and_validate_scan_spec(stream, context);
     }
 
     static bool read_reset_marker (BufferStream& stream, JPGLoadingContext& context) {
@@ -425,10 +485,11 @@ namespace Gfx {
                 table.symbols.append(symbol);
             }
 
-            if (table_type == 0)
-                context.dc_tables.append(move(table));
-            else
-                context.ac_tables.append(move(table));
+            auto& table_vec = table_type == 0 ? context.dc_tables : context.ac_tables;
+            // If table exists at that slot, replace it with the new one.
+            if (table_vec.size() > table.destination_id)
+                table_vec[table.destination_id] = move(table);
+            else table_vec.append(move(table));
 
             bytes_to_read -= 1 + 16 + total_codes;
         }
@@ -586,7 +647,7 @@ namespace Gfx {
         return !stream.handle_read_failure();
     }
 
-    void dequantize(JPGLoadingContext& context, Vector<Macroblock>& macroblocks) {
+    void dequantize (JPGLoadingContext& context, Vector<Macroblock>& macroblocks) {
         for (u32 vcursor = 0; vcursor < context.mblock_meta.vcount; vcursor += context.vsample_factor) {
             for (u32 hcursor = 0; hcursor < context.mblock_meta.hcount; hcursor += context.hsample_factor) {
                 for (u8 cindex = 0; cindex < context.component_count; cindex++) {
@@ -594,7 +655,8 @@ namespace Gfx {
                     const u32* table = component.qtable_id == 0 ? context.luma_table : context.chroma_table;
                     for (u32 vfactor_i = 0; vfactor_i < component.vsample_factor; vfactor_i++) {
                         for (u32 hfactor_i = 0; hfactor_i < component.hsample_factor; hfactor_i++) {
-                            u32 mb_index = (vcursor + vfactor_i) * context.mblock_meta.hpadded_count + (hfactor_i + hcursor);
+                            u32 mb_index =
+                                (vcursor + vfactor_i) * context.mblock_meta.hpadded_count + (hfactor_i + hcursor);
                             Macroblock& block = macroblocks[mb_index];
                             int* block_component = cindex == 0 ? block.y : (cindex == 1 ? block.cb : block.cr);
                             for (u32 k = 0; k < 64; k++)
@@ -607,7 +669,7 @@ namespace Gfx {
     }
 
 
-    void inverse_dct(const JPGLoadingContext& context, Vector<Macroblock>& macroblocks) {
+    void inverse_dct (const JPGLoadingContext& context, Vector<Macroblock>& macroblocks) {
         static const float m0 = 2.0 * cos(1.0 / 16.0 * 2.0 * M_PI);
         static const float m1 = 2.0 * cos(2.0 / 16.0 * 2.0 * M_PI);
         static const float m3 = 2.0 * cos(2.0 / 16.0 * 2.0 * M_PI);
@@ -773,7 +835,7 @@ namespace Gfx {
         }
     }
 
-    void ycbcr_to_rgb(const JPGLoadingContext& context, Vector<Macroblock>& macroblocks) {
+    void ycbcr_to_rgb (const JPGLoadingContext& context, Vector<Macroblock>& macroblocks) {
         for (u32 vcursor = 0; vcursor < context.mblock_meta.vcount; vcursor += context.vsample_factor) {
             for (u32 hcursor = 0; hcursor < context.mblock_meta.hcount; hcursor += context.hsample_factor) {
                 const u32 chroma_block_index = vcursor * context.mblock_meta.hpadded_count + hcursor;
@@ -781,7 +843,8 @@ namespace Gfx {
                 // Overflows are intentional.
                 for (u8 vfactor_i = context.vsample_factor - 1; vfactor_i < context.vsample_factor; --vfactor_i) {
                     for (u8 hfactor_i = context.hsample_factor - 1; hfactor_i < context.hsample_factor; --hfactor_i) {
-                        u32 mb_index = (vcursor + vfactor_i) * context.mblock_meta.hpadded_count + (hcursor + hfactor_i);
+                        u32 mb_index =
+                            (vcursor + vfactor_i) * context.mblock_meta.hpadded_count + (hcursor + hfactor_i);
                         i32* y = macroblocks[mb_index].y;
                         i32* cb = macroblocks[mb_index].cb;
                         i32* cr = macroblocks[mb_index].cr;
@@ -794,7 +857,7 @@ namespace Gfx {
                                 int r = y[pixel] + 1.402f * chroma.cr[chroma_pixel] + 128;
                                 int g = y[pixel] - 0.344f * chroma.cb[chroma_pixel] - 0.714f * chroma.cr[chroma_pixel] + 128;
                                 int b = y[pixel] + 1.772f * chroma.cb[chroma_pixel] + 128;
-                                y[pixel]  = r < 0 ? 0 : (r > 255 ? 255 : r);
+                                y[pixel] = r < 0 ? 0 : (r > 255 ? 255 : r);
                                 cb[pixel] = g < 0 ? 0 : (g > 255 ? 255 : g);
                                 cr[pixel] = b < 0 ? 0 : (b > 255 ? 255 : b);
                             }
@@ -806,7 +869,7 @@ namespace Gfx {
     }
 
     static void compose_bitmap (JPGLoadingContext& context, const Vector<Macroblock>& macroblocks) {
-        context.bitmap = Bitmap::create_purgeable(BitmapFormat::RGB32, {context.frame.width, context.frame.height});
+        context.bitmap = Bitmap::create_purgeable(BitmapFormat::RGB32, { context.frame.width, context.frame.height });
 
         for (u32 y = context.frame.height - 1; y < context.frame.height; y--) {
             const u32 block_row = y / 8;
@@ -816,7 +879,7 @@ namespace Gfx {
                 auto& block = macroblocks[block_row * context.mblock_meta.hpadded_count + block_column];
                 const u32 pixel_column = x % 8;
                 const u32 pixel_index = pixel_row * 8 + pixel_column;
-                const Color color { (u8)block.y[pixel_index], (u8)block.cb[pixel_index], (u8)block.cr[pixel_index]};
+                const Color color { (u8) block.y[pixel_index], (u8) block.cb[pixel_index], (u8) block.cr[pixel_index] };
                 context.bitmap->set_pixel(x, y, color);
             }
         }
@@ -846,7 +909,12 @@ namespace Gfx {
                 case JPG_EOI:
                     dbg() << stream.offset() << String::format(": Unexpected marker %x!", marker);
                     return false;
+                case JPG_SOF2:
+                    dbg() << "Proceeding to decode progressive JPEG";
+                    context.is_progressive = true;
+                    [[fallthrough]];
                 case JPG_SOF0:
+                    dbg() << "Proceeding to decode baseline JPEG";
                     if (!read_start_of_frame(stream, context))
                         return false;
                     context.state = JPGLoadingContext::FrameDecoded;
@@ -877,7 +945,7 @@ namespace Gfx {
         ASSERT_NOT_REACHED();
     }
 
-    static bool scan_huffman_stream (BufferStream& stream, JPGLoadingContext& context) {
+    static Marker scan_huffman_stream (BufferStream& stream, JPGLoadingContext& context) {
         u8 last_byte;
         u8 current_byte;
         stream >> current_byte;
@@ -887,7 +955,7 @@ namespace Gfx {
             stream >> current_byte;
             if (stream.handle_read_failure()) {
                 dbg() << stream.offset() << ": EOI not found!";
-                return false;
+                return JPG_INVALID;
             }
 
             if (last_byte == 0xFF) {
@@ -899,15 +967,15 @@ namespace Gfx {
                     continue;
                 }
                 Marker marker = 0xFF00 | current_byte;
-                if (marker == JPG_EOI)
-                    return true;
+                if (marker == JPG_EOI || marker == JPG_DHT || marker == JPG_SOS)
+                    return marker;
                 if (marker >= JPG_RST0 && marker <= JPG_RST7) {
                     context.huffman_stream.stream.append(marker);
                     stream >> current_byte;
                     continue;
                 }
                 dbg() << stream.offset() << String::format(": Invalid marker: %x!", marker);
-                return false;
+                return JPG_INVALID;
             } else {
                 context.huffman_stream.stream.append(last_byte);
             }
@@ -921,15 +989,28 @@ namespace Gfx {
         BufferStream stream(buffer);
         if (!parse_header(stream, context))
             return false;
-        if (!scan_huffman_stream(stream, context))
-            return false;
+
+        Marker scan_terminator;
+        while ((scan_terminator = scan_huffman_stream(stream, context)) != JPG_EOI) {
+            if (scan_terminator == JPG_INVALID) {
+                dbg() << "Something went wrong while scanning huffman stream!";
+                return false;
+            }
+            if (scan_terminator == JPG_SOS) {
+                dbg() << "Reading new scan segment...";
+                read_start_of_scan(stream, context);
+            }
+            if (scan_terminator == JPG_DHT) {
+                dbg() << "Reading new huffman table specs...";
+                read_huffman_table(stream, context);
+            }
+        }
 
         auto result = decode_huffman_stream(context);
         if (!result.has_value()) {
             dbg() << stream.offset() << ": Failed to decode Macroblocks!";
             return false;
-        }
-        else {
+        } else {
             auto macroblocks = result.release_value();
             dbg() << String::format("%i macroblocks decoded successfully :^)", macroblocks.size());
             dequantize(context, macroblocks);
@@ -954,7 +1035,7 @@ namespace Gfx {
         if (m_context->state == JPGLoadingContext::State::Error)
             return {};
         if (m_context->state >= JPGLoadingContext::State::FrameDecoded)
-            return {m_context->frame.width, m_context->frame.height};
+            return { m_context->frame.width, m_context->frame.height };
 
         return {};
     }
@@ -1002,7 +1083,7 @@ namespace Gfx {
 
     ImageFrameDescriptor JPGImageDecoderPlugin::frame (size_t i) {
         if (i > 0) {
-            return {bitmap(), 0};
+            return { bitmap(), 0 };
         }
         return {};
     }
@@ -1014,8 +1095,9 @@ namespace Gfx {
         JPGImageDecoderPlugin jpg_decoder((const u8*) mapped_file.data(), mapped_file.size());
         auto bitmap = jpg_decoder.bitmap();
         if (bitmap)
-            bitmap->set_mmap_name( String::format("Gfx::Bitmap [%dx%d] - Decoded JPG: %s",
-                bitmap->width(), bitmap->height(), LexicalPath::canonicalized_path(path).characters()));
+            bitmap->set_mmap_name(String::format("Gfx::Bitmap [%dx%d] - Decoded JPG: %s",
+                                                 bitmap->width(), bitmap->height(),
+                                                 LexicalPath::canonicalized_path(path).characters()));
         return bitmap;
     }
 }

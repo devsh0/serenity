@@ -80,6 +80,7 @@
 #define JPG_EOI 0xFFD9
 #define JPG_RST 0XFFDD
 #define JPG_SOF0 0XFFC0
+#define JPG_SOF2 0xFFC2
 #define JPG_SOI 0XFFD8
 #define JPG_SOS 0XFFDA
 #define JPG_COM 0xFFFE
@@ -118,6 +119,21 @@ namespace Gfx {
         u32 vcount;
         u32 hpadded_count;
         u32 vpadded_count;
+    };
+
+    struct ScanSpec {
+        enum class ScanType {
+            DC_FIRST = 0,
+            DC_REFINE,
+            AC_FIRST,
+            AC_REFINE
+        };
+
+        ScanType type = {ScanType::DC_FIRST};
+        u8 approx_hi;
+        u8 approx_lo;
+        u8 spectral_start;
+        u8 spectral_end;
     };
 
     struct ComponentSpec {
@@ -168,6 +184,8 @@ namespace Gfx {
         size_t compressed_size { 0 };
         u32 luma_table[64];
         u32 chroma_table[64];
+        bool is_progressive { false };
+        ScanSpec scan_spec;
         StartOfFrame frame;
         u8 hsample_factor;
         u8 vsample_factor;
@@ -180,7 +198,7 @@ namespace Gfx {
         Vector<HuffmanTableSpec> ac_tables;
         HuffmanStreamState huffman_stream;
         i32 previous_dc_values[3] = { 0 };
-        MacroblockMeta mblock_meta;
+        MacroblockMeta mblock_meta; // Macroblock meta
     };
 
     class JPGImageDecoderPlugin final : public ImageDecoderPlugin {
