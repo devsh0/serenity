@@ -101,7 +101,7 @@ namespace Gfx {
         u32 vpadded_count;
     };
 
-    struct Component {
+    struct ComponentSpec {
         i8 id { -1 };
         u8 hsample_factor { 1 }; // Horizontal sampling factor.
         u8 vsample_factor { 1 }; // Vertical sampling factor.
@@ -122,7 +122,7 @@ namespace Gfx {
         u16 width;
     };
 
-    struct HuffmanTable {
+    struct HuffmanTableSpec {
         u8 type;
         u8 destination_id;
         u8 code_counts[16] = { 0 };
@@ -154,11 +154,11 @@ namespace Gfx {
         u8 vsample_factor;
         bool has_zero_based_ids;
         u8 component_count;
-        Component components[3];
+        ComponentSpec components[3];
         RefPtr<Gfx::Bitmap> bitmap;
         u16 dc_reset_interval;
-        Vector<HuffmanTable> dc_tables;
-        Vector<HuffmanTable> ac_tables;
+        Vector<HuffmanTableSpec> dc_tables;
+        Vector<HuffmanTableSpec> ac_tables;
         HuffmanStreamState huffman_stream;
         i32 previous_dc_values[3] = { 0 };
         MCUMeta mcu_meta;

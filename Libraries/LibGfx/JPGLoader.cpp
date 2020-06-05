@@ -54,7 +54,7 @@ namespace Gfx {
 
     using Marker = u16;
 
-    void generate_huffman_codes (HuffmanTable& table) {
+    void generate_huffman_codes (HuffmanTableSpec& table) {
         unsigned code = 0;
         for (auto number_of_codes : table.code_counts) {
             for (int i = 0; i < number_of_codes; i++)
@@ -86,7 +86,7 @@ namespace Gfx {
         return value;
     }
 
-    Optional<u8> get_next_symbol (HuffmanStreamState& hstream, const HuffmanTable& table) {
+    Optional<u8> get_next_symbol (HuffmanStreamState& hstream, const HuffmanTableSpec& table) {
         unsigned code = 0;
         size_t code_cursor = 0;
         for (int i = 0; i < 16; i++) { // Codes can't be longer than 16 bits.
@@ -112,8 +112,8 @@ namespace Gfx {
      * in that order. If sample factors differ from one, we'll read more than
      * one block of y-coefficients before we get to read a cb-cr block.
      *
-     * In the function below, `hindex` and `vindex` are the indices of row and column
-     * of this MCU in the giant MCU matrix. `sfactor_vi` and `sfactor_hi` are cursors
+     * In the function below, `hcursor` and `vcursor` denote the location of the MCU
+     * we're building in the giant MCU matrix. `vfactor_i` and `hfactor_i` are cursors
      * that iterate over the vertical and horizontal subsampling factors, respectively.
      * When we finish one iteration of the innermost loop, we'll have the coefficients
      * of one of the components of MCU at position `mcu_index`. When the outermost loop
@@ -121,12 +121,12 @@ namespace Gfx {
      * MCUs that share the chrominance data. Next two iterations (assuming that we're
      * dealing with three components) will fill up the same MCUs with chrominance data.
      */
-    bool build_mcus (JPGLoadingContext& context, Vector<MCU>& mcus, u8 hindex, u8 vindex) {
+    bool build_mcus (JPGLoadingContext& context, Vector<MCU>& mcus, u8 hcursor, u8 vcursor) {
         for (u32 cindex = 0; cindex < context.component_count; cindex++) {
             auto& component = context.components[cindex];
-            for (u8 sfactor_vi = 0; sfactor_vi < component.vsample_factor; sfactor_vi++) {
-                for (u8 sfactor_hi = 0; sfactor_hi < component.hsample_factor; sfactor_hi++) {
-                    u32 mcu_index = (vindex + sfactor_vi) * context.mcu_meta.hpadded_count + (sfactor_hi + hindex);
+            for (u8 vfactor_i = 0; vfactor_i < component.vsample_factor; vfactor_i++) {
+                for (u8 hfactor_i = 0; hfactor_i < component.hsample_factor; hfactor_i++) {
+                    u32 mcu_index = (vcursor + vfactor_i) * context.mcu_meta.hpadded_count + (hfactor_i + hcursor);
                     MCU& mcu = mcus[mcu_index];
 
                     auto& dc_table = context.dc_tables[component.dc_destination_id];
@@ -215,26 +215,30 @@ namespace Gfx {
         for (auto& ac_table : context.ac_tables)
             generate_huffman_codes(ac_table);
 
-        for (u32 vindex = 0; vindex < context.mcu_meta.vcount; vindex += context.vsample_factor) {
-            for (u32 hindex = 0; hindex < context.mcu_meta.hcount; hindex += context.hsample_factor) {
-                u32 i = vindex * context.mcu_meta.hpadded_count + hindex;
+        for (u32 vcursor = 0; vcursor < context.mcu_meta.vcount; vcursor += context.vsample_factor) {
+            for (u32 hcursor = 0; hcursor < context.mcu_meta.hcount; hcursor += context.hsample_factor) {
+                u32 i = vcursor * context.mcu_meta.hpadded_count + hcursor;
                 if (context.dc_reset_interval > 0) {
                     if (i % context.dc_reset_interval == 0) {
                         context.previous_dc_values[0] = 0;
                         context.previous_dc_values[1] = 0;
                         context.previous_dc_values[2] = 0;
 
-                        // Advance the huffman stream cursor to the 0th bit of the next byte.
+                        // Restart markers are stored in byte boundaries. Advance the huffman stream cursor to
+                        //  the 0th bit of the next byte.
                         if (context.huffman_stream.byte_offset < context.huffman_stream.stream.size()) {
                             if (context.huffman_stream.bit_offset > 0) {
                                 context.huffman_stream.bit_offset = 0;
                                 context.huffman_stream.byte_offset++;
                             }
+
+                            // Skip the restart marker (RSTn).
+                            context.huffman_stream.byte_offset++;
                         }
                     }
                 }
 
-                if (!build_mcus(context, mcus, hindex, vindex)) {
+                if (!build_mcus(context, mcus, hcursor, vcursor)) {
                     dbg() << "Failed to build MCU " << i + 1;
                     dbg() << "Huffman stream byte offset " << context.huffman_stream.byte_offset;
                     dbg() << "Huffman stream bit offset " << context.huffman_stream.bit_offset;
@@ -321,7 +325,7 @@ namespace Gfx {
         }
 
         for (int i = 0; i < component_count; i++) {
-            Component* component = nullptr;
+            ComponentSpec* component = nullptr;
             u8 component_id;
             stream >> component_id;
             component_id += context.has_zero_based_ids ? 1 : 0;
@@ -378,7 +382,7 @@ namespace Gfx {
             return false;
         bytes_to_read -= 2;
         while (bytes_to_read > 0) {
-            HuffmanTable table;
+            HuffmanTableSpec table;
             u8 table_info;
             stream >> table_info;
             u8 table_type = table_info >> 4;
@@ -427,9 +431,10 @@ namespace Gfx {
         return true;
     }
 
-    static inline bool validate_luma_and_modify_context (const Component& luma, JPGLoadingContext& context) {
+    static inline bool validate_luma_and_modify_context (const ComponentSpec& luma, JPGLoadingContext& context) {
         if ((luma.hsample_factor == 1 || luma.hsample_factor == 2) &&
             (luma.vsample_factor == 1 || luma.vsample_factor == 2)) {
+            // 
             context.mcu_meta.hpadded_count += luma.hsample_factor == 1 ? 0 : context.mcu_meta.hcount % 2;
             context.mcu_meta.vpadded_count += luma.vsample_factor == 1 ? 0 : context.mcu_meta.vcount % 2;
             context.mcu_meta.padded_total = context.mcu_meta.hpadded_count * context.mcu_meta.vpadded_count;
@@ -488,7 +493,7 @@ namespace Gfx {
         }
 
         for (int i = 0; i < context.component_count; i++) {
-            Component& component = context.components[i];
+            ComponentSpec& component = context.components[i];
 
             stream >> component.id;
             if (i == 0) context.has_zero_based_ids = component.id == 0;
@@ -500,6 +505,8 @@ namespace Gfx {
             component.vsample_factor = subsample_factors & 0x0F;
 
             if (component.id == 1) {
+                // By convention, downsampling is applied only on chroma components. So we should
+                //  hope to see the maximum sampling factor in the luma component.
                 if (!validate_luma_and_modify_context(component, context)) {
                     dbg() << stream.offset() << ": Unsupported luma subsampling factors: "
                           << "horizontal: " << component.hsample_factor << ", vertical: " << component.vsample_factor;
@@ -573,14 +580,14 @@ namespace Gfx {
     }
 
     void dequantize(JPGLoadingContext& context, Vector<MCU>& mcus) {
-        for (u32 vindex = 0; vindex < context.mcu_meta.vcount; vindex += context.vsample_factor) {
-            for (u32 hindex = 0; hindex < context.mcu_meta.hcount; hindex += context.hsample_factor) {
+        for (u32 vcursor = 0; vcursor < context.mcu_meta.vcount; vcursor += context.vsample_factor) {
+            for (u32 hcursor = 0; hcursor < context.mcu_meta.hcount; hcursor += context.hsample_factor) {
                 for (u8 cindex = 0; cindex < context.component_count; cindex++) {
                     auto& component = context.components[cindex];
                     const u32* table = component.qtable_id == 0 ? context.luma_table : context.chroma_table;
-                    for (u32 sfactor_vi = 0; sfactor_vi < component.vsample_factor; sfactor_vi++) {
-                        for (u32 sfactor_hi = 0; sfactor_hi < component.hsample_factor; sfactor_hi++) {
-                            u32 mcu_index = (vindex + sfactor_vi) * context.mcu_meta.hpadded_count + (sfactor_hi + hindex);
+                    for (u32 vfactor_i = 0; vfactor_i < component.vsample_factor; vfactor_i++) {
+                        for (u32 hfactor_i = 0; hfactor_i < component.hsample_factor; hfactor_i++) {
+                            u32 mcu_index = (vcursor + vfactor_i) * context.mcu_meta.hpadded_count + (hfactor_i + hcursor);
                             MCU& mcu = mcus[mcu_index];
                             int* mcu_component = cindex == 0 ? mcu.y : (cindex == 1 ? mcu.cb : mcu.cr);
                             for (u32 k = 0; k < 64; k++)
@@ -609,13 +616,13 @@ namespace Gfx {
         static const float s6 = cos(6.0 / 16.0 * M_PI) / 2.0;
         static const float s7 = cos(7.0 / 16.0 * M_PI) / 2.0;
 
-        for (u32 vindex = 0; vindex < context.mcu_meta.vcount; vindex += context.vsample_factor) {
-            for (u32 hindex = 0; hindex < context.mcu_meta.hcount; hindex += context.hsample_factor) {
+        for (u32 vcursor = 0; vcursor < context.mcu_meta.vcount; vcursor += context.vsample_factor) {
+            for (u32 hcursor = 0; hcursor < context.mcu_meta.hcount; hcursor += context.hsample_factor) {
                 for (u8 cindex = 0; cindex < context.component_count; cindex++) {
                     auto& component = context.components[cindex];
-                    for (u8 sfactor_vi = 0; sfactor_vi < component.vsample_factor; sfactor_vi++) {
-                        for (u8 sfactor_hi = 0; sfactor_hi < component.hsample_factor; sfactor_hi++) {
-                            u32 mcu_index = (vindex + sfactor_vi) * context.mcu_meta.hpadded_count + (sfactor_hi + hindex);
+                    for (u8 vfactor_i = 0; vfactor_i < component.vsample_factor; vfactor_i++) {
+                        for (u8 hfactor_i = 0; hfactor_i < component.hsample_factor; hfactor_i++) {
+                            u32 mcu_index = (vcursor + vfactor_i) * context.mcu_meta.hpadded_count + (hfactor_i + hcursor);
                             MCU& mcu = mcus[mcu_index];
                             i32* mcu_component = cindex == 0 ? mcu.y : (cindex == 1 ? mcu.cb : mcu.cr);
                             for (u32 k = 0; k < 8; ++k) {
@@ -760,22 +767,22 @@ namespace Gfx {
     }
 
     void ycbcr_to_rgb(const JPGLoadingContext& context, Vector<MCU>& mcus) {
-        for (u32 vindex = 0; vindex < context.mcu_meta.vcount; vindex += context.vsample_factor) {
-            for (u32 hindex = 0; hindex < context.mcu_meta.hcount; hindex += context.hsample_factor) {
-                const u32 chroma_mcu_index = vindex * context.mcu_meta.hpadded_count + hindex;
+        for (u32 vcursor = 0; vcursor < context.mcu_meta.vcount; vcursor += context.vsample_factor) {
+            for (u32 hcursor = 0; hcursor < context.mcu_meta.hcount; hcursor += context.hsample_factor) {
+                const u32 chroma_mcu_index = vcursor * context.mcu_meta.hpadded_count + hcursor;
                 const MCU& chroma = mcus[chroma_mcu_index];
                 // Overflows are intentional.
-                for (u8 sfactor_vi = context.vsample_factor - 1; sfactor_vi < context.vsample_factor; --sfactor_vi) {
-                    for (u8 sfactor_hi = context.hsample_factor - 1; sfactor_hi < context.hsample_factor; --sfactor_hi) {
-                        u32 mcu_index = (vindex + sfactor_vi) * context.mcu_meta.hpadded_count + (hindex + sfactor_hi);
+                for (u8 vfactor_i = context.vsample_factor - 1; vfactor_i < context.vsample_factor; --vfactor_i) {
+                    for (u8 hfactor_i = context.hsample_factor - 1; hfactor_i < context.hsample_factor; --hfactor_i) {
+                        u32 mcu_index = (vcursor + vfactor_i) * context.mcu_meta.hpadded_count + (hcursor + hfactor_i);
                         i32* y = mcus[mcu_index].y;
                         i32* cb = mcus[mcu_index].cb;
                         i32* cr = mcus[mcu_index].cr;
                         for (u8 i = 7; i < 8; --i) {
                             for (u8 j = 7; j < 8; --j) {
                                 const u8 pixel = i * 8 + j;
-                                const u32 chroma_pxrow = (i / context.vsample_factor) + 4 * sfactor_vi;
-                                const u32 chroma_pxcol = (j / context.hsample_factor) + 4 * sfactor_hi;
+                                const u32 chroma_pxrow = (i / context.vsample_factor) + 4 * vfactor_i;
+                                const u32 chroma_pxcol = (j / context.hsample_factor) + 4 * hfactor_i;
                                 const u32 chroma_pixel = chroma_pxrow * 8 + chroma_pxcol;
                                 int r = y[pixel] + 1.402f * chroma.cr[chroma_pixel] + 128;
                                 int g = y[pixel] - 0.344f * chroma.cb[chroma_pixel] - 0.714f * chroma.cr[chroma_pixel] + 128;
@@ -862,7 +869,7 @@ namespace Gfx {
 
         ASSERT_NOT_REACHED();
     }
-    
+
     static bool scan_huffman_stream (BufferStream& stream, JPGLoadingContext& context) {
         u8 last_byte;
         u8 current_byte;
@@ -888,6 +895,7 @@ namespace Gfx {
                 if (marker == JPG_EOI)
                     return true;
                 if (marker >= JPG_RST0 && marker <= JPG_RST7) {
+                    context.huffman_stream.stream.append(marker);
                     stream >> current_byte;
                     continue;
                 }
