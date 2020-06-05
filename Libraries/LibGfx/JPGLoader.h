@@ -86,13 +86,32 @@
 
 namespace Gfx {
 
-    struct MCU {
-        i32 y[64] = { 0 };
-        i32 cb[64] = { 0 };
-        i32 cr[64] = { 0 };
+    /*
+     * MCU means group of data units that are coded together. A data unit is an 8x8
+     * block of component data. In interleaved scans, number of non-interleaved data
+     * units of a component C is Ch * Cv, where Ch and Cv represent the horizontal &
+     * vertical subsampling factors of the component, respectively. A MacroBlock is
+     * an 8x8 block of RGB values before encoding, and 8x8 block of YCbCr values when
+     * we're done decoding the huffman stream.
+     */
+    struct Macroblock {
+        union {
+            i32 y[64] = { 0 };
+            i32 r[64];
+        };
+
+        union {
+            i32 cb[64] = { 0 };
+            i32 g[64];
+        };
+
+        union {
+            i32 cr[64] = { 0 };
+            i32 b[64];
+        };
     };
 
-    struct MCUMeta {
+    struct MacroblockMeta {
         u32 total;
         u32 padded_total;
         u32 hcount;
@@ -161,7 +180,7 @@ namespace Gfx {
         Vector<HuffmanTableSpec> ac_tables;
         HuffmanStreamState huffman_stream;
         i32 previous_dc_values[3] = { 0 };
-        MCUMeta mcu_meta;
+        MacroblockMeta mblock_meta;
     };
 
     class JPGImageDecoderPlugin final : public ImageDecoderPlugin {
