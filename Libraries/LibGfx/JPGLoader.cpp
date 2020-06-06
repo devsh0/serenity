@@ -129,16 +129,14 @@ namespace Gfx {
         return dc_diff;
     }
 
-    // output["symbol"] = Symbol, output["run_length"] = Run Length,
-    // output["coeff_length"] = Coefficient Length, output["coeff"] = Coefficient.
+    // out["symbol"] = Symbol, out["run_length"] = Run Length, out["coeff_length"] = Coefficient Length, out["coeff"] = Coefficient.
     Optional<HashMap<String, i32>> decode_ac (const HuffmanTableSpec& table_spec, JPGLoadingContext& context) {
         HashMap<String, i32> output;
         auto symbol_or_error = get_next_symbol(context.huffman_stream, table_spec);
         if (!symbol_or_error.has_value()) return {};
 
-        // AC symbols encode 2 pieces of information, the high 4 bits represent
-        // number of zeroes to be stuffed before reading the coefficient. Low 4
-        // bits represent the magnitude of the coefficient.
+        // AC symbols encode 2 pieces of information. The high 4 bits represent number of zeroes to be stuffed
+        //  before reading the coefficient. Low 4 bits represent the magnitude of the coefficient.
         auto ac_symbol = symbol_or_error.release_value();
         output.set("symbol", ac_symbol);
         if (ac_symbol == 0) return output;
@@ -189,6 +187,7 @@ namespace Gfx {
                     Macroblock& block = macroblocks[macroblock_index];
                     i32* select_component = component.id == 1 ? block.y : (component.id == 2 ? block.cb : block.cr);
 
+                    
                     auto dc_diff_or_error = decode_dc(context.dc_tables[component.dc_destination_id], context);
                     if (!dc_diff_or_error.has_value()) return false;
                     auto& previous_dc = context.previous_dc_values[cindex];
@@ -226,34 +225,16 @@ namespace Gfx {
         return true;
     }
 
-    Optional<Vector<Macroblock>> decode_huffman_stream (JPGLoadingContext& context) {
-        Vector<Macroblock> macroblocks;
-        macroblocks.resize(context.block_meta.padded_total);
-
-        dbg() << "Image width: " << context.frame.width;
-        dbg() << "Image height: " << context.frame.height;
-        dbg() << "Macroblocks in a row: " << context.block_meta.hpadded_count;
-        dbg() << "Macroblocks in a column: " << context.block_meta.vpadded_count;
-
-
-        // Compute huffman codes for DC and AC tables.
-        for (auto& dc_table : context.dc_tables)
-            generate_huffman_codes(dc_table);
-
-        for (auto& ac_table : context.ac_tables)
-            generate_huffman_codes(ac_table);
-
+    bool decode (Vector<Macroblock>& macroblocks, JPGLoadingContext& context) {
         for (u32 vcursor = 0; vcursor < context.block_meta.vcount; vcursor += context.vsample_factor) {
             for (u32 hcursor = 0; hcursor < context.block_meta.hcount; hcursor += context.hsample_factor) {
                 u32 i = vcursor * context.block_meta.hpadded_count + hcursor;
                 if (context.dc_reset_interval > 0) {
                     if (i % context.dc_reset_interval == 0) {
-                        context.previous_dc_values[0] = 0;
-                        context.previous_dc_values[1] = 0;
-                        context.previous_dc_values[2] = 0;
+                        for (ComponentSpec* spec : context.scan_spec.components)
+                            context.previous_dc_values[spec->id - 1] = 0;
 
-                        // Restart markers are stored in byte boundaries. Advance the huffman stream cursor to
-                        //  the 0th bit of the next byte.
+                        // Restart markers are stored in byte boundaries. Advance the cursor to 0th bit of the next byte.
                         if (context.huffman_stream.byte_offset < context.huffman_stream.stream.size()) {
                             if (context.huffman_stream.bit_offset > 0) {
                                 context.huffman_stream.bit_offset = 0;
@@ -270,12 +251,28 @@ namespace Gfx {
                     dbg() << "Failed to build Macroblock " << i + 1;
                     dbg() << "Huffman stream byte offset " << context.huffman_stream.byte_offset;
                     dbg() << "Huffman stream bit offset " << context.huffman_stream.bit_offset;
-                    return {};
+                    return false;
                 }
             }
         }
 
-        return macroblocks;
+        return true;
+    }
+
+    bool decode_huffman_stream (Vector<Macroblock>& macroblocks, JPGLoadingContext& context) {
+        dbg() << "Image width: " << context.frame.width;
+        dbg() << "Image height: " << context.frame.height;
+        dbg() << "Macroblocks in a row: " << context.block_meta.hpadded_count;
+        dbg() << "Macroblocks in a column: " << context.block_meta.vpadded_count;
+
+        // Compute huffman codes for DC and AC tables.
+        for (auto& dc_table : context.dc_tables)
+            generate_huffman_codes(dc_table);
+
+        for (auto& ac_table : context.ac_tables)
+            generate_huffman_codes(ac_table);
+
+        return decode(macroblocks, context);
     }
 
     static inline bool bounds_okay (const size_t cursor, const size_t delta, const size_t bound) {
@@ -985,11 +982,8 @@ namespace Gfx {
         ASSERT_NOT_REACHED();
     }
 
-    static inline bool decode_macroblocks (JPGLoadingContext& context) {
-        auto blocks_or_error = decode_huffman_stream(context);
-        if (!blocks_or_error.has_value()) return false;
-
-        auto macroblocks = blocks_or_error.release_value();
+    static inline bool decode_macroblocks (Vector<Macroblock>& macroblocks, JPGLoadingContext& context) {
+        if (!decode_huffman_stream(macroblocks, context)) return false;
         dbg() << String::format("%i macroblocks decoded successfully :^)", macroblocks.size());
         dequantize(context, macroblocks);
         inverse_dct(context, macroblocks);
@@ -1007,6 +1001,9 @@ namespace Gfx {
             return false;
         }
 
+        Vector<Macroblock> macroblocks;
+        macroblocks.resize(context.block_meta.padded_total);
+
         for (;;) {
             switch (scan_huffman_stream(stream, context)) {
                 case Marker::JPG_INVALID:
@@ -1022,7 +1019,7 @@ namespace Gfx {
                     break;
                 default:
                     // EOI found.
-                    if (!decode_macroblocks(context)) {
+                    if (!decode_macroblocks(macroblocks, context)) {
                         dbg() << stream.offset() << ": Failed to decode Macroblocks!";
                         return false;
                     }
