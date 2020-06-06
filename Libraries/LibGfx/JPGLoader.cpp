@@ -105,19 +105,20 @@ namespace Gfx {
         return {};
     }
 
-    Optional<i32> decode_dc (const HuffmanTableSpec& table_spec, JPGLoadingContext& context) {
-        auto symbol_or_error = get_next_symbol(context.huffman_stream, table_spec);
-        if (!symbol_or_error.has_value()) return {};
+    bool decode_and_store_dc (ComponentSpec& component, Macroblock& block, const HuffmanTableSpec& table, JPGLoadingContext& context) {
+        i32* select_component = component.id == 1 ? block.y : (component.id == 2 ? block.cb : block.cr);
+        auto symbol_or_error = get_next_symbol(context.huffman_stream, table);
+        if (!symbol_or_error.has_value()) return false;
 
         // For DC coefficients, symbol encodes the length of the coefficient.
         auto dc_length = symbol_or_error.release_value();
         if (dc_length > 11) {
             dbg() << String::format("DC coefficient too long: %i!", dc_length);
-            return {};
+            return false;
         }
 
         auto coeff_or_error = read_huffman_bits(context.huffman_stream, dc_length);
-        if (!coeff_or_error.has_value()) return {};
+        if (!coeff_or_error.has_value()) return false;
 
         // DC coefficients are encoded as the difference between previous and current DC values.
         i32 dc_diff = coeff_or_error.release_value();
@@ -126,10 +127,11 @@ namespace Gfx {
         if (dc_length != 0 && dc_diff < (1 << (dc_length - 1)))
             dc_diff -= (1 << dc_length) - 1;
 
-        return dc_diff;
+        auto& previous_dc = context.previous_dc_values[component.id - 1];
+        select_component[0] = previous_dc += dc_diff;
+        return true;
     }
 
-    // out["symbol"] = Symbol, out["run_length"] = Run Length, out["coeff_length"] = Coefficient Length, out["coeff"] = Coefficient.
     Optional<HashMap<String, i32>> decode_ac (const HuffmanTableSpec& table_spec, JPGLoadingContext& context) {
         HashMap<String, i32> output;
         auto symbol_or_error = get_next_symbol(context.huffman_stream, table_spec);
@@ -178,7 +180,7 @@ namespace Gfx {
      * macroblocks that share the chrominance data. Next two iterations (assuming that
      * we are dealing with three components) will fill up the blocks with chroma data.
      */
-    bool build_macroblocks (JPGLoadingContext& context, Vector<Macroblock>& macroblocks, u8 hcursor, u8 vcursor) {
+    bool build_macroblocks (Vector<Macroblock>& macroblocks, JPGLoadingContext& context, u8 hcursor, u8 vcursor) {
         for (u32 cindex = 0; cindex < context.component_count; cindex++) {
             auto& component = context.components[cindex];
             for (u8 vfactor_i = 0; vfactor_i < component.vsample_factor; vfactor_i++) {
@@ -187,14 +189,12 @@ namespace Gfx {
                     Macroblock& block = macroblocks[macroblock_index];
                     i32* select_component = component.id == 1 ? block.y : (component.id == 2 ? block.cb : block.cr);
 
-                    
-                    auto dc_diff_or_error = decode_dc(context.dc_tables[component.dc_destination_id], context);
-                    if (!dc_diff_or_error.has_value()) return false;
-                    auto& previous_dc = context.previous_dc_values[cindex];
-                    select_component[0] = previous_dc += dc_diff_or_error.value();
+                   if (!decode_and_store_dc(component, block, context.dc_tables[component.dc_destination_id], context))
+                       return false;
 
                     // Compute the AC coefficients.
-                    for (int j = 1; j < 64;) {
+                    int j = context.is_progressive ? context.scan_spec.spectral_start : 1;
+                    while (j <= context.scan_spec.spectral_end) {
                         auto ac_or_error = decode_ac(context.ac_tables[component.ac_destination_id], context);
                         if (!ac_or_error.has_value()) return false;
                         auto output = ac_or_error.release_value();
@@ -247,7 +247,7 @@ namespace Gfx {
                     }
                 }
 
-                if (!build_macroblocks(context, macroblocks, hcursor, vcursor)) {
+                if (!build_macroblocks(macroblocks, context, hcursor, vcursor)) {
                     dbg() << "Failed to build Macroblock " << i + 1;
                     dbg() << "Huffman stream byte offset " << context.huffman_stream.byte_offset;
                     dbg() << "Huffman stream bit offset " << context.huffman_stream.bit_offset;
