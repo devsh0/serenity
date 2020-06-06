@@ -105,9 +105,11 @@ namespace Gfx {
         return {};
     }
 
-    bool decode_and_store_dc (ComponentSpec& component, Macroblock& block, const HuffmanTableSpec& table, JPGLoadingContext& context) {
+    bool decode_and_store_dc (const ComponentSpec& component, Macroblock& block, JPGLoadingContext& context) {
         i32* select_component = component.id == 1 ? block.y : (component.id == 2 ? block.cb : block.cr);
-        auto symbol_or_error = get_next_symbol(context.huffman_stream, table);
+        const HuffmanTableSpec& table_spec = context.dc_tables[component.dc_destination_id];
+
+        auto symbol_or_error = get_next_symbol(context.huffman_stream, table_spec);
         if (!symbol_or_error.has_value()) return false;
 
         // For DC coefficients, symbol encodes the length of the coefficient.
@@ -132,37 +134,52 @@ namespace Gfx {
         return true;
     }
 
-    Optional<HashMap<String, i32>> decode_ac (const HuffmanTableSpec& table_spec, JPGLoadingContext& context) {
-        HashMap<String, i32> output;
-        auto symbol_or_error = get_next_symbol(context.huffman_stream, table_spec);
-        if (!symbol_or_error.has_value()) return {};
+    bool decode_and_store_ac (const ComponentSpec& component, Macroblock& block, JPGLoadingContext& context) {
+        i32* select_component = component.id == 1 ? block.y : (component.id == 2 ? block.cb : block.cr);
+        const HuffmanTableSpec& table_spec = context.ac_tables[component.ac_destination_id];
 
-        // AC symbols encode 2 pieces of information. The high 4 bits represent number of zeroes to be stuffed
-        //  before reading the coefficient. Low 4 bits represent the magnitude of the coefficient.
-        auto ac_symbol = symbol_or_error.release_value();
-        output.set("symbol", ac_symbol);
-        if (ac_symbol == 0) return output;
+        // DC coefficient is already decoded if this is a baseline JPEG. In that case, we should start from 1.
+        u8 j = context.is_progressive ? context.scan_spec.spectral_start : 1;
+        while (j <= context.scan_spec.spectral_end) {
+            auto symbol_or_error = get_next_symbol(context.huffman_stream, table_spec);
+            if (!symbol_or_error.has_value()) return false;
 
-        // ac_symbol = 0xF0 means we need to skip 16 zeroes.
-        output.set("run_length", ac_symbol == 0xF0 ? 16 : ac_symbol >> 4);
+            // AC symbols encode 2 pieces of information. The high 4 bits represent number of zeroes to be stuffed
+            //  before reading the coefficient. Low 4 bits represent the magnitude of the coefficient.
+            auto ac_symbol = symbol_or_error.release_value();
+            if (ac_symbol == 0) {
+                while (j <= context.scan_spec.spectral_end)
+                    select_component[zigzag_map[j++]] = 0;
+                return true;
+            }
 
-        u8 coeff_length = ac_symbol & 0x0F;
-        if (coeff_length > 10) {
-            dbg() << String::format("AC coefficient too long: %i!", coeff_length);
-            return {};
+            // ac_symbol = 0xF0 means we need to skip 16 zeroes.
+            auto run_length = ac_symbol == 0xF0 ? 16 : ac_symbol >> 4;
+            if (j + run_length > context.scan_spec.spectral_end) {
+                dbg() << String::format("Run-length exceeded boundaries. Cursor: %i, Skipping: %i!", j, run_length);
+                return false;
+            }
+
+            for (int k = 0; k < run_length; k++)
+                select_component[zigzag_map[j++]] = 0;
+
+            u8 coeff_length = ac_symbol & 0x0F;
+            if (coeff_length > 10) {
+                dbg() << String::format("AC coefficient too long: %i!", coeff_length);
+                return false;
+            }
+
+            if (coeff_length > 0) {
+                auto coeff_or_error = read_huffman_bits(context.huffman_stream, coeff_length);
+                if (!coeff_or_error.has_value()) return {};
+                i32 ac_coefficient = coeff_or_error.release_value();
+                if (ac_coefficient < (1 << (coeff_length - 1)))
+                    ac_coefficient -= (1 << coeff_length) - 1;
+                select_component[zigzag_map[j++]] = ac_coefficient;
+            }
         }
-        output.set("coeff_length", coeff_length);
 
-        if (coeff_length > 0) {
-            auto coeff_or_error = read_huffman_bits(context.huffman_stream, coeff_length);
-            if (!coeff_or_error.has_value()) return {};
-            i32 ac_coefficient = coeff_or_error.release_value();
-            if (ac_coefficient < (1 << (coeff_length - 1)))
-                ac_coefficient -= (1 << coeff_length) - 1;
-            output.set("coeff", ac_coefficient);
-        }
-
-        return output;
+        return true;
     }
 
     /*
@@ -181,43 +198,18 @@ namespace Gfx {
      * we are dealing with three components) will fill up the blocks with chroma data.
      */
     bool build_macroblocks (Vector<Macroblock>& macroblocks, JPGLoadingContext& context, u8 hcursor, u8 vcursor) {
-        for (u32 cindex = 0; cindex < context.component_count; cindex++) {
+        for (u32 cindex = 0; cindex < context.scan_spec.component_count; cindex++) {
             auto& component = context.components[cindex];
             for (u8 vfactor_i = 0; vfactor_i < component.vsample_factor; vfactor_i++) {
                 for (u8 hfactor_i = 0; hfactor_i < component.hsample_factor; hfactor_i++) {
                     u32 macroblock_index = (vcursor + vfactor_i) * context.block_meta.hpadded_count + (hfactor_i + hcursor);
                     Macroblock& block = macroblocks[macroblock_index];
-                    i32* select_component = component.id == 1 ? block.y : (component.id == 2 ? block.cb : block.cr);
 
-                   if (!decode_and_store_dc(component, block, context.dc_tables[component.dc_destination_id], context))
+                   if (!decode_and_store_dc(component, block, context))
                        return false;
 
-                    // Compute the AC coefficients.
-                    int j = context.is_progressive ? context.scan_spec.spectral_start : 1;
-                    while (j <= context.scan_spec.spectral_end) {
-                        auto ac_or_error = decode_ac(context.ac_tables[component.ac_destination_id], context);
-                        if (!ac_or_error.has_value()) return false;
-                        auto output = ac_or_error.release_value();
-
-                        if (output.get("symbol").value() == 0) {
-                            for (; j < 64; j++)
-                                select_component[zigzag_map[j]] = 0;
-                            continue;
-                        }
-
-                        auto run_length = output.get("run_length").release_value();
-                        if (j + run_length >= 64) {
-                            dbg() << String::format("Run-length exceeded boundaries. Cursor: %i, Skipping: %i!", j, run_length);
-                            return false;
-                        }
-
-                        for (int k = 0; k < run_length; k++)
-                            select_component[zigzag_map[j++]] = 0;
-
-                        // If coeff_length == 0, we need to read another symbol to decode the coefficient.
-                        if (output.get("coeff_length").value() != 0)
-                            select_component[zigzag_map[j++]] = output.get("coeff").release_value();
-                    }
+                   if (!decode_and_store_ac(component, block, context))
+                       return false;
                 }
             }
         }
