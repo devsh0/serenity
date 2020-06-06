@@ -118,14 +118,14 @@ namespace Gfx {
         u32 padded_total;
         u32 hcount;
         u32 vcount;
-        u32 hpadded_count;
-        u32 vpadded_count;
+        u32 hpadded_count; // Horizontal macroblock count after padding.
+        u32 vpadded_count; // Vertical macroblock count after padding.
     };
 
     struct ComponentSpec {
         i8 id { -1 };
-        u8 hsample_factor { 1 }; // Horizontal sampling factor.
-        u8 vsample_factor { 1 }; // Vertical sampling factor.
+        u8 horizontal_sampling { 1 };
+        u8 vertical_sampling { 1 };
         u8 ac_destination_id;
         u8 dc_destination_id;
         u8 qtable_id; // Quantization table id.
@@ -185,8 +185,8 @@ namespace Gfx {
         ScanSpec scan_spec;
         MacroblockMeta block_meta; // Macroblock meta.
         FrameSpec frame;
-        u8 hsample_factor;
-        u8 vsample_factor;
+        u8 horizontal_sampling;
+        u8 vertical_sampling;
         bool has_zero_based_ids;
         u8 component_count;
         ComponentSpec components[3];

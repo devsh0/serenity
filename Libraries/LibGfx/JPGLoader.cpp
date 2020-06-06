@@ -64,7 +64,7 @@ namespace Gfx {
 
     Optional<size_t> read_huffman_bits (HuffmanStreamState& hstream, size_t count = 1) {
         if (count > (8 * sizeof(size_t))) {
-            dbg() << String::format("Can't read %i bits at once!", count);
+            dbg() << String::format("Can't read %d bits at once!", count);
             return {};
         }
         size_t value = 0;
@@ -99,8 +99,6 @@ namespace Gfx {
             }
         }
 
-        // Let's not crash the browser now...rather just close all operations gracefully.
-        // ASSERT_NOT_REACHED();
         dbg() << "If you're seeing this...the jpeg decoder needs to support more kinds of JPEGs!";
         return {};
     }
@@ -115,7 +113,7 @@ namespace Gfx {
         // For DC coefficients, symbol encodes the length of the coefficient.
         auto dc_length = symbol_or_error.release_value();
         if (dc_length > 11) {
-            dbg() << String::format("DC coefficient too long: %i!", dc_length);
+            dbg() << String::format("DC coefficient too long: %d!", dc_length);
             return false;
         }
 
@@ -129,8 +127,19 @@ namespace Gfx {
         if (dc_length != 0 && dc_diff < (1 << (dc_length - 1)))
             dc_diff -= (1 << dc_length) - 1;
 
+        // Apply point transform. This has no affect when processing baseline JPEGs.
         auto& previous_dc = context.previous_dc_values[component.id - 1];
-        select_component[0] = previous_dc += dc_diff;
+        previous_dc = (previous_dc + dc_diff) >> context.scan_spec.approx_lo;
+        select_component[0] = previous_dc;
+        return true;
+    }
+
+    bool refine_and_store_dc (const ComponentSpec& component, Macroblock& block, JPGLoadingContext& context) {
+        i32* select_component = component.id == 1 ? block.y : (component.id == 2 ? block.cb : block.cr);
+        auto bit_or_error = read_huffman_bits(context.huffman_stream, 1);
+        if (!bit_or_error.has_value()) return false;
+        // FIXME: I'm not sure about this.
+        select_component[0] |= (bit_or_error.value() << context.scan_spec.approx_lo);
         return true;
     }
 
@@ -156,7 +165,7 @@ namespace Gfx {
             // ac_symbol = 0xF0 means we need to skip 16 zeroes.
             auto run_length = ac_symbol == 0xF0 ? 16 : ac_symbol >> 4;
             if (j + run_length > context.scan_spec.spectral_end) {
-                dbg() << String::format("Run-length exceeded boundaries. Cursor: %i, Skipping: %i!", j, run_length);
+                dbg() << String::format("Run-length exceeded boundaries. Cursor: %d, Skipping: %d!", j, run_length);
                 return false;
             }
 
@@ -165,7 +174,7 @@ namespace Gfx {
 
             u8 coeff_length = ac_symbol & 0x0F;
             if (coeff_length > 10) {
-                dbg() << String::format("AC coefficient too long: %i!", coeff_length);
+                dbg() << String::format("AC coefficient too long: %d!", coeff_length);
                 return false;
             }
 
@@ -175,41 +184,46 @@ namespace Gfx {
                 i32 ac_coefficient = coeff_or_error.release_value();
                 if (ac_coefficient < (1 << (coeff_length - 1)))
                     ac_coefficient -= (1 << coeff_length) - 1;
-                select_component[zigzag_map[j++]] = ac_coefficient;
+                // FIXME?
+                select_component[zigzag_map[j++]] = ac_coefficient / (1 << context.scan_spec.approx_lo);
             }
         }
 
         return true;
     }
 
-    /*
-     * Build the macroblocks possible by reading single (MCU) subsampled pair of CbCr.
-     * Depending on the sampling factors, we may not see triples of Y, Cb, Cr in that
-     * order. If sample factors differ from one, we'll read more than one block of y-
-     * coefficients before we get to read a cb-cr block.
-     *
-     * In the function below, `hcursor` and `vcursor` denote the location of the block
-     * we're building in the macroblock matrix. `vfactor_i` and `hfactor_i` are cursors
-     * that iterate over the vertical and horizontal subsampling factors, respectively.
-     * When we finish one iteration of the innermost loop, we'll have the coefficients
-     * of one of the components of block at position `macroblock_index`. When the outermost loop
-     * finishes first iteration, we'll have all the luminance coefficients for all the
-     * macroblocks that share the chrominance data. Next two iterations (assuming that
-     * we are dealing with three components) will fill up the blocks with chroma data.
-     */
+    bool refine_and_store_ac (const ComponentSpec& component, Macroblock& block, JPGLoadingContext& context) {
+        i32* select_component = component.id == 1 ? block.y : (component.id == 2 ? block.cb : block.cr);
+        auto bit_or_error = read_huffman_bits(context.huffman_stream, 1);
+        if (!bit_or_error.has_value()) return false;
+        select_component[0] = (select_component[0] << 1) | bit_or_error.value();
+        return true;
+    }
+
     bool build_macroblocks (Vector<Macroblock>& macroblocks, JPGLoadingContext& context, u8 hcursor, u8 vcursor) {
         for (u32 cindex = 0; cindex < context.scan_spec.component_count; cindex++) {
             auto& component = context.components[cindex];
-            for (u8 vfactor_i = 0; vfactor_i < component.vsample_factor; vfactor_i++) {
-                for (u8 hfactor_i = 0; hfactor_i < component.hsample_factor; hfactor_i++) {
-                    u32 macroblock_index = (vcursor + vfactor_i) * context.block_meta.hpadded_count + (hfactor_i + hcursor);
-                    Macroblock& block = macroblocks[macroblock_index];
-
-                   if (!decode_and_store_dc(component, block, context))
-                       return false;
-
-                   if (!decode_and_store_ac(component, block, context))
-                       return false;
+            for (u8 vfactor_i = 0; vfactor_i < component.vertical_sampling; vfactor_i++) {
+                for (u8 hfactor_i = 0; hfactor_i < component.horizontal_sampling; hfactor_i++) {
+                    auto& block = macroblocks[(vcursor + vfactor_i) * context.block_meta.hpadded_count + (hfactor_i + hcursor)];
+                    if (context.is_progressive) {
+                        if (context.scan_spec.type == ScanType::DC) {
+                            if ((context.scan_spec.refining && !refine_and_store_dc(component, block, context)) ||
+                                !decode_and_store_dc(component, block, context))
+                                return false;
+                        } else {
+                            if ((context.scan_spec.refining && !refine_and_store_ac(component, block, context)) ||
+                                !decode_and_store_ac(component, block, context))
+                                return false;
+                        }
+                    }
+                    else {
+                        // Baseline sequential mode.
+                        if (!decode_and_store_dc(component, block, context))
+                            return false;
+                        if (!decode_and_store_ac(component, block, context))
+                            return false;
+                    }
                 }
             }
         }
@@ -217,9 +231,16 @@ namespace Gfx {
         return true;
     }
 
-    bool decode (Vector<Macroblock>& macroblocks, JPGLoadingContext& context) {
-        for (u32 vcursor = 0; vcursor < context.block_meta.vcount; vcursor += context.vsample_factor) {
-            for (u32 hcursor = 0; hcursor < context.block_meta.hcount; hcursor += context.hsample_factor) {
+    bool decode_huffman_stream (Vector<Macroblock>& macroblocks, JPGLoadingContext& context) {
+        // Compute huffman codes for DC and AC tables.
+        for (auto& dc_table : context.dc_tables)
+            generate_huffman_codes(dc_table);
+
+        for (auto& ac_table : context.ac_tables)
+            generate_huffman_codes(ac_table);
+
+        for (u32 vcursor = 0; vcursor < context.block_meta.vcount; vcursor += context.vertical_sampling) {
+            for (u32 hcursor = 0; hcursor < context.block_meta.hcount; hcursor += context.horizontal_sampling) {
                 u32 i = vcursor * context.block_meta.hpadded_count + hcursor;
                 if (context.dc_reset_interval > 0) {
                     if (i % context.dc_reset_interval == 0) {
@@ -249,22 +270,6 @@ namespace Gfx {
         }
 
         return true;
-    }
-
-    bool decode_huffman_stream (Vector<Macroblock>& macroblocks, JPGLoadingContext& context) {
-        dbg() << "Image width: " << context.frame.width;
-        dbg() << "Image height: " << context.frame.height;
-        dbg() << "Macroblocks in a row: " << context.block_meta.hpadded_count;
-        dbg() << "Macroblocks in a column: " << context.block_meta.vpadded_count;
-
-        // Compute huffman codes for DC and AC tables.
-        for (auto& dc_table : context.dc_tables)
-            generate_huffman_codes(dc_table);
-
-        for (auto& ac_table : context.ac_tables)
-            generate_huffman_codes(ac_table);
-
-        return decode(macroblocks, context);
     }
 
     static inline bool bounds_okay (const size_t cursor, const size_t delta, const size_t bound) {
@@ -362,7 +367,9 @@ namespace Gfx {
                 return false;
 
             context.scan_spec.type = context.scan_spec.spectral_start == 0 ? ScanType::DC : ScanType::AC;
+            dbg() << "Processing " << (context.scan_spec.type == ScanType::DC ? "DC" : "AC") << " scan...";
             context.scan_spec.refining = context.scan_spec.successive_approx_used && context.scan_spec.approx_hi != 0;
+            dbg() << "Scan Type: " << (context.scan_spec.refining ? "Refine" : "First");
             return true;
         }
 
@@ -387,7 +394,7 @@ namespace Gfx {
         u8 component_count;
         stream >> component_count;
         if (component_count > context.component_count) {
-            dbg() << stream.offset() << String::format(": Unsupported number of components: %i!", component_count);
+            dbg() << stream.offset() << String::format(": Unsupported number of components: %d!", component_count);
             return false;
         }
         context.scan_spec.component_count = component_count;
@@ -409,7 +416,7 @@ namespace Gfx {
             else if (component_id == context.components[2].id)
                 component = &context.components[2];
             else {
-                dbg() << stream.offset() << String::format(": Unsupported component id: %i!", component_id);
+                dbg() << stream.offset() << String::format(": Unsupported component id: %d!", component_id);
                 return false;
             }
 
@@ -448,12 +455,12 @@ namespace Gfx {
             u8 table_type = table_info >> 4;
             u8 table_destination_id = table_info & 0x0F;
             if (table_type > 1) {
-                dbg() << stream.offset() << String::format(": Unrecognized huffman table: %i!", table_type);
+                dbg() << stream.offset() << String::format(": Unrecognized huffman table: %d!", table_type);
                 return false;
             }
             if (table_destination_id > 3) {
                 dbg() << stream.offset()
-                      << String::format(": Invalid huffman table destination id: %i!", table_destination_id);
+                      << String::format(": Invalid huffman table destination id: %d!", table_destination_id);
                 return false;
             }
             table.type = table_type;
@@ -493,16 +500,16 @@ namespace Gfx {
     }
 
     static inline bool validate_luma_and_modify_context (const ComponentSpec& luma, JPGLoadingContext& context) {
-        if ((luma.hsample_factor == 1 || luma.hsample_factor == 2) &&
-            (luma.vsample_factor == 1 || luma.vsample_factor == 2)) {
-            context.block_meta.hpadded_count += luma.hsample_factor == 1 ? 0 : context.block_meta.hcount % 2;
-            context.block_meta.vpadded_count += luma.vsample_factor == 1 ? 0 : context.block_meta.vcount % 2;
+        if ((luma.horizontal_sampling == 1 || luma.horizontal_sampling == 2) &&
+            (luma.vertical_sampling == 1 || luma.vertical_sampling == 2)) {
+            context.block_meta.hpadded_count += luma.horizontal_sampling == 1 ? 0 : context.block_meta.hcount % 2;
+            context.block_meta.vpadded_count += luma.vertical_sampling == 1 ? 0 : context.block_meta.vcount % 2;
             context.block_meta.padded_total = context.block_meta.hpadded_count * context.block_meta.vpadded_count;
             // For easy reference to relevant sample factors.
-            context.hsample_factor = luma.hsample_factor;
-            context.vsample_factor = luma.vsample_factor;
-            dbg() << String::format("Horizontal Subsampling Factor: %i", luma.hsample_factor);
-            dbg() << String::format("Vertical Subsampling Factor: %i", luma.vsample_factor);
+            context.horizontal_sampling = luma.horizontal_sampling;
+            context.vertical_sampling = luma.vertical_sampling;
+            dbg() << String::format("Horizontal Subsampling Factor: %d", luma.horizontal_sampling);
+            dbg() << String::format("Vertical Subsampling Factor: %d", luma.vertical_sampling);
             return true;
         }
         return false;
@@ -560,21 +567,21 @@ namespace Gfx {
 
             u8 subsample_factors;
             stream >> subsample_factors;
-            component.hsample_factor = subsample_factors >> 4;
-            component.vsample_factor = subsample_factors & 0x0F;
+            component.horizontal_sampling = subsample_factors >> 4;
+            component.vertical_sampling = subsample_factors & 0x0F;
 
             if (component.id == 1) {
                 // By convention, downsampling is applied only on chroma components. So we should
                 //  hope to see the maximum sampling factor in the luma component.
                 if (!validate_luma_and_modify_context(component, context)) {
                     dbg() << stream.offset() << ": Unsupported luma subsampling factors: "
-                          << "horizontal: " << component.hsample_factor << ", vertical: " << component.vsample_factor << "!";
+                          << "horizontal: " << component.horizontal_sampling << ", vertical: " << component.vertical_sampling << "!";
                     return false;
                 }
             } else {
-                if (component.hsample_factor != 1 || component.vsample_factor != 1) {
+                if (component.horizontal_sampling != 1 || component.vertical_sampling != 1) {
                     dbg() << stream.offset() << ": Unsupported chroma subsampling factors: "
-                          << "horizontal: " << component.hsample_factor << ", vertical: " << component.vsample_factor << "!";
+                          << "horizontal: " << component.horizontal_sampling << ", vertical: " << component.vertical_sampling << "!";
                     return false;
                 }
             }
@@ -602,12 +609,12 @@ namespace Gfx {
             u8 element_unit_hint = info_byte >> 4;
             if (element_unit_hint > 1) {
                 dbg() << stream.offset()
-                      << String::format(": Unsupported unit hint in quantization table: %i!", element_unit_hint);
+                      << String::format(": Unsupported unit hint in quantization table: %d!", element_unit_hint);
                 return false;
             }
             u8 table_id = info_byte & 0x0F;
             if (table_id > 1) {
-                dbg() << stream.offset() << String::format(": Unsupported quantization table id: %i!", table_id);
+                dbg() << stream.offset() << String::format(": Unsupported quantization table id: %d!", table_id);
                 return false;
             }
             u32* table = table_id == 0 ? context.luma_table : context.chroma_table;
@@ -639,13 +646,13 @@ namespace Gfx {
     }
 
     void dequantize (JPGLoadingContext& context, Vector<Macroblock>& macroblocks) {
-        for (u32 vcursor = 0; vcursor < context.block_meta.vcount; vcursor += context.vsample_factor) {
-            for (u32 hcursor = 0; hcursor < context.block_meta.hcount; hcursor += context.hsample_factor) {
+        for (u32 vcursor = 0; vcursor < context.block_meta.vcount; vcursor += context.vertical_sampling) {
+            for (u32 hcursor = 0; hcursor < context.block_meta.hcount; hcursor += context.horizontal_sampling) {
                 for (u8 cindex = 0; cindex < context.component_count; cindex++) {
                     auto& component = context.components[cindex];
                     const u32* table = component.qtable_id == 0 ? context.luma_table : context.chroma_table;
-                    for (u32 vfactor_i = 0; vfactor_i < component.vsample_factor; vfactor_i++) {
-                        for (u32 hfactor_i = 0; hfactor_i < component.hsample_factor; hfactor_i++) {
+                    for (u32 vfactor_i = 0; vfactor_i < component.vertical_sampling; vfactor_i++) {
+                        for (u32 hfactor_i = 0; hfactor_i < component.horizontal_sampling; hfactor_i++) {
                             u32 macroblock_index = (vcursor + vfactor_i) * context.block_meta.hpadded_count + (hfactor_i + hcursor);
                             Macroblock& block = macroblocks[macroblock_index];
                             int* block_component = cindex == 0 ? block.y : (cindex == 1 ? block.cb : block.cr);
@@ -675,12 +682,12 @@ namespace Gfx {
         static const float s6 = cos(6.0 / 16.0 * M_PI) / 2.0;
         static const float s7 = cos(7.0 / 16.0 * M_PI) / 2.0;
 
-        for (u32 vcursor = 0; vcursor < context.block_meta.vcount; vcursor += context.vsample_factor) {
-            for (u32 hcursor = 0; hcursor < context.block_meta.hcount; hcursor += context.hsample_factor) {
+        for (u32 vcursor = 0; vcursor < context.block_meta.vcount; vcursor += context.vertical_sampling) {
+            for (u32 hcursor = 0; hcursor < context.block_meta.hcount; hcursor += context.horizontal_sampling) {
                 for (u8 cindex = 0; cindex < context.component_count; cindex++) {
                     auto& component = context.components[cindex];
-                    for (u8 vfactor_i = 0; vfactor_i < component.vsample_factor; vfactor_i++) {
-                        for (u8 hfactor_i = 0; hfactor_i < component.hsample_factor; hfactor_i++) {
+                    for (u8 vfactor_i = 0; vfactor_i < component.vertical_sampling; vfactor_i++) {
+                        for (u8 hfactor_i = 0; hfactor_i < component.horizontal_sampling; hfactor_i++) {
                             u32 macroblock_index = (vcursor + vfactor_i) * context.block_meta.hpadded_count + (hfactor_i + hcursor);
                             Macroblock& block = macroblocks[macroblock_index];
                             i32* block_component = cindex == 0 ? block.y : (cindex == 1 ? block.cb : block.cr);
@@ -826,13 +833,13 @@ namespace Gfx {
     }
 
     void ycbcr_to_rgb (const JPGLoadingContext& context, Vector<Macroblock>& macroblocks) {
-        for (u32 vcursor = 0; vcursor < context.block_meta.vcount; vcursor += context.vsample_factor) {
-            for (u32 hcursor = 0; hcursor < context.block_meta.hcount; hcursor += context.hsample_factor) {
+        for (u32 vcursor = 0; vcursor < context.block_meta.vcount; vcursor += context.vertical_sampling) {
+            for (u32 hcursor = 0; hcursor < context.block_meta.hcount; hcursor += context.horizontal_sampling) {
                 const u32 chroma_block_index = vcursor * context.block_meta.hpadded_count + hcursor;
                 const Macroblock& chroma = macroblocks[chroma_block_index];
                 // Overflows are intentional.
-                for (u8 vfactor_i = context.vsample_factor - 1; vfactor_i < context.vsample_factor; --vfactor_i) {
-                    for (u8 hfactor_i = context.hsample_factor - 1; hfactor_i < context.hsample_factor; --hfactor_i) {
+                for (u8 vfactor_i = context.vertical_sampling - 1; vfactor_i < context.vertical_sampling; --vfactor_i) {
+                    for (u8 hfactor_i = context.horizontal_sampling - 1; hfactor_i < context.horizontal_sampling; --hfactor_i) {
                         u32 macroblock_index = (vcursor + vfactor_i) * context.block_meta.hpadded_count + (hcursor + hfactor_i);
                         i32* y = macroblocks[macroblock_index].y;
                         i32* cb = macroblocks[macroblock_index].cb;
@@ -840,8 +847,8 @@ namespace Gfx {
                         for (u8 i = 7; i < 8; --i) {
                             for (u8 j = 7; j < 8; --j) {
                                 const u8 pixel = i * 8 + j;
-                                const u32 chroma_pxrow = (i / context.vsample_factor) + 4 * vfactor_i;
-                                const u32 chroma_pxcol = (j / context.hsample_factor) + 4 * hfactor_i;
+                                const u32 chroma_pxrow = (i / context.vertical_sampling) + 4 * vfactor_i;
+                                const u32 chroma_pxcol = (j / context.horizontal_sampling) + 4 * hfactor_i;
                                 const u32 chroma_pixel = chroma_pxrow * 8 + chroma_pxcol;
                                 int r = y[pixel] + 1.402f * chroma.cr[chroma_pixel] + 128;
                                 int g = y[pixel] - 0.344f * chroma.cb[chroma_pixel] - 0.714f * chroma.cr[chroma_pixel] + 128;
@@ -899,11 +906,12 @@ namespace Gfx {
                     dbg() << stream.offset() << String::format(": Unexpected marker %x!", marker);
                     return false;
                 case Marker::JPG_SOF2:
-                    dbg() << "Proceeding to decode progressive JPEG";
                     context.is_progressive = true;
                     [[fallthrough]];
                 case Marker::JPG_SOF0:
-                    dbg() << "Proceeding to decode baseline JPEG";
+                    if (context.is_progressive)
+                        dbg() << "Proceeding to decode progressive JPEG...";
+                    else dbg() << "Proceeding to decode baseline JPEG...";
                     if (!read_start_of_frame(stream, context))
                         return false;
                     context.state = JPGLoadingContext::FrameDecoded;
@@ -974,9 +982,8 @@ namespace Gfx {
         ASSERT_NOT_REACHED();
     }
 
-    static inline bool decode_macroblocks (Vector<Macroblock>& macroblocks, JPGLoadingContext& context) {
-        if (!decode_huffman_stream(macroblocks, context)) return false;
-        dbg() << String::format("%i macroblocks decoded successfully :^)", macroblocks.size());
+    static inline bool process_macroblocks (Vector<Macroblock>& macroblocks, JPGLoadingContext& context) {
+        dbg() << String::format("%d macroblocks decoded successfully :)", macroblocks.size());
         dequantize(context, macroblocks);
         inverse_dct(context, macroblocks);
         ycbcr_to_rgb(context, macroblocks);
@@ -993,29 +1000,45 @@ namespace Gfx {
             return false;
         }
 
+        dbg() << "Image width: " << context.frame.width;
+        dbg() << "Image height: " << context.frame.height;
+        dbg() << "Macroblocks in a row: " << context.block_meta.hpadded_count;
+        dbg() << "Macroblocks in a column: " << context.block_meta.vpadded_count;
+
         Vector<Macroblock> macroblocks;
         macroblocks.resize(context.block_meta.padded_total);
 
+        Marker segment_terminator = scan_huffman_stream(stream, context);
+        if (!decode_huffman_stream(macroblocks, context)) {
+            dbg() << "Couldn't decode huffman stream!";
+            return false;
+        }
+
         for (;;) {
-            switch (scan_huffman_stream(stream, context)) {
+            switch (segment_terminator) {
                 case Marker::JPG_INVALID:
-                    dbg() << "Something went wrong while scanning huffman stream!";
+                    dbg() << "Something went wrong!";
                     return false;
                 case Marker::JPG_SOS:
                     dbg() << "Reading new scan segment...";
-                    read_start_of_scan(stream, context);
+                    if (!read_start_of_scan(stream, context)) return false;
+                    dbg() << "Reading huffman stream...";
+                    segment_terminator = scan_huffman_stream(stream, context);
+                    if (segment_terminator == Marker::JPG_INVALID) return false;
+                    dbg() << "Decoding huffman stream...";
+                    if (!decode_huffman_stream(macroblocks, context)) return false;
                     break;
                 case Marker::JPG_DHT:
-                    dbg() << "Reading new huffman table specs...";
-                    read_huffman_table(stream, context);
+                    dbg() << "Reading new huffman table spec...";
+                    if (!read_huffman_table(stream, context)) return false;
+                    segment_terminator = read_marker_at_cursor(stream);
                     break;
+                case Marker::JPG_EOI:
+                    dbg() << "End of image found.";
+                    return process_macroblocks(macroblocks, context);
                 default:
-                    // EOI found.
-                    if (!decode_macroblocks(macroblocks, context)) {
-                        dbg() << stream.offset() << ": Failed to decode Macroblocks!";
-                        return false;
-                    }
-                    return true;
+                    dbg() << String::format("Huffman stream ended with unexpected marker (%02x)!", segment_terminator);
+                    return false;
             }
         }
 
