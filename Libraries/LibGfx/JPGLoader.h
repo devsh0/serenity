@@ -30,60 +30,61 @@
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/ImageDecoder.h>
 
-#define JPG_INVALID 0X0000
+enum class Marker {
+    JPG_INVALID = 0X0000,
 
-#define JPG_APPN0 0XFFE0
-#define JPG_APPN1 0XFFE1
-#define JPG_APPN2 0XFFE2
-#define JPG_APPN3 0XFFE3
-#define JPG_APPN4 0XFFE4
-#define JPG_APPN5 0XFFE5
-#define JPG_APPN6 0XFFE6
-#define JPG_APPN7 0XFFE7
-#define JPG_APPN8 0XFFE8
-#define JPG_APPN9 0XFFE9
-#define JPG_APPNA 0XFFEA
-#define JPG_APPNB 0XFFEB
-#define JPG_APPNC 0XFFEC
-#define JPG_APPND 0XFFED
-#define JPG_APPNE 0xFFEE
-#define JPG_APPNF 0xFFEF
+    JPG_APPN0 = 0XFFE0,
+    JPG_APPN1 = 0XFFE1,
+    JPG_APPN2 = 0XFFE2,
+    JPG_APPN3 = 0XFFE3,
+    JPG_APPN4 = 0XFFE4,
+    JPG_APPN5 = 0XFFE5,
+    JPG_APPN6 = 0XFFE6,
+    JPG_APPN7 = 0XFFE7,
+    JPG_APPN8 = 0XFFE8,
+    JPG_APPN9 = 0XFFE9,
+    JPG_APPNA = 0XFFEA,
+    JPG_APPNB = 0XFFEB,
+    JPG_APPNC = 0XFFEC,
+    JPG_APPND = 0XFFED,
+    JPG_APPNE = 0xFFEE,
+    JPG_APPNF = 0xFFEF,
 
-#define JPG_RESERVED1 0xFFF1
-#define JPG_RESERVED2 0xFFF2
-#define JPG_RESERVED3 0xFFF3
-#define JPG_RESERVED4 0xFFF4
-#define JPG_RESERVED5 0xFFF5
-#define JPG_RESERVED6 0xFFF6
-#define JPG_RESERVED7 0xFFF7
-#define JPG_RESERVED8 0xFFF8
-#define JPG_RESERVED9 0xFFF9
-#define JPG_RESERVEDA 0xFFFA
-#define JPG_RESERVEDB 0xFFFB
-#define JPG_RESERVEDC 0xFFFC
-#define JPG_RESERVEDD 0xFFFD
+    JPG_RESERVED1 = 0xFFF1,
+    JPG_RESERVED2 = 0xFFF2,
+    JPG_RESERVED3 = 0xFFF3,
+    JPG_RESERVED4 = 0xFFF4,
+    JPG_RESERVED5 = 0xFFF5,
+    JPG_RESERVED6 = 0xFFF6,
+    JPG_RESERVED7 = 0xFFF7,
+    JPG_RESERVED8 = 0xFFF8,
+    JPG_RESERVED9 = 0xFFF9,
+    JPG_RESERVEDA = 0xFFFA,
+    JPG_RESERVEDB = 0xFFFB,
+    JPG_RESERVEDC = 0xFFFC,
+    JPG_RESERVEDD = 0xFFFD,
 
-#define JPG_RST0 0xFFD0
-#define JPG_RST1 0xFFD1
-#define JPG_RST2 0xFFD2
-#define JPG_RST3 0xFFD3
-#define JPG_RST4 0xFFD4
-#define JPG_RST5 0xFFD5
-#define JPG_RST6 0xFFD6
-#define JPG_RST7 0xFFD7
+    JPG_RST0 = 0xFFD0,
+    JPG_RST1 = 0xFFD1,
+    JPG_RST2 = 0xFFD2,
+    JPG_RST3 = 0xFFD3,
+    JPG_RST4 = 0xFFD4,
+    JPG_RST5 = 0xFFD5,
+    JPG_RST6 = 0xFFD6,
+    JPG_RST7 = 0xFFD7,
 
-#define JPG_DHP 0xFFDE
-#define JPG_EXP 0xFFDF
-
-#define JPG_DHT 0XFFC4
-#define JPG_DQT 0XFFDB
-#define JPG_EOI 0xFFD9
-#define JPG_RST 0XFFDD
-#define JPG_SOF0 0XFFC0
-#define JPG_SOF2 0xFFC2
-#define JPG_SOI 0XFFD8
-#define JPG_SOS 0XFFDA
-#define JPG_COM 0xFFFE
+    JPG_DHP = 0xFFDE,
+    JPG_EXP = 0xFFDF,
+    JPG_DHT = 0XFFC4,
+    JPG_DQT = 0XFFDB,
+    JPG_EOI = 0xFFD9,
+    JPG_RST = 0XFFDD,
+    JPG_SOF0 = 0XFFC0,
+    JPG_SOF2 = 0xFFC2,
+    JPG_SOI = 0XFFD8,
+    JPG_SOS = 0XFFDA,
+    JPG_COM = 0xFFFE
+};
 
 namespace Gfx {
 
@@ -130,21 +131,21 @@ namespace Gfx {
         u8 qtable_id; // Quantization table id.
     };
 
-    struct ScanSpec {
-        enum class ScanType {
-            DC_FIRST = 0,
-            DC_REFINE,
-            AC_FIRST,
-            AC_REFINE
-        };
+    enum class ScanType {
+        DC,
+        AC
+    };
 
-        ScanType type = {ScanType::DC_FIRST};
+    struct ScanSpec {
+        ScanType type = { ScanType::DC };
         Vector<ComponentSpec*> components;
         u8 component_count;
-        u8 approx_hi;
-        u8 approx_lo;
         u8 spectral_start;
         u8 spectral_end;
+        bool successive_approx_used { false };
+        bool refining { false };
+        u8 approx_hi;
+        u8 approx_lo;
     };
 
     struct StartOfFrame {

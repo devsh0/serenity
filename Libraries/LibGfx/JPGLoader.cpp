@@ -53,8 +53,6 @@ namespace Gfx {
         53, 60, 61, 54, 47, 55, 62, 63
     };
 
-    using Marker = u16;
-
     void generate_huffman_codes (HuffmanTableSpec& table) {
         unsigned code = 0;
         for (auto number_of_codes : table.code_counts) {
@@ -285,26 +283,26 @@ namespace Gfx {
     }
 
     static inline bool is_valid_marker (const Marker marker) {
-        if (marker >= JPG_APPN0 && marker <= JPG_APPNF) {
-            if (marker != JPG_APPN0)
+        if (marker >= Marker::JPG_APPN0 && marker <= Marker::JPG_APPNF) {
+            if (marker != Marker::JPG_APPN0)
                 dbg() << String::format("%04x not supported yet. The decoder may fail!", marker);
             return true;
         }
-        if (marker >= JPG_RESERVED1 && marker <= JPG_RESERVEDD)
+        if (marker >= Marker::JPG_RESERVED1 && marker <= Marker::JPG_RESERVEDD)
             return true;
-        if (marker >= JPG_RST0 && marker <= JPG_RST7)
+        if (marker >= Marker::JPG_RST0 && marker <= Marker::JPG_RST7)
             return true;
         switch (marker) {
-            case JPG_COM:
-            case JPG_DHP:
-            case JPG_EXP:
-            case JPG_DHT:
-            case JPG_DQT:
-            case JPG_RST:
-            case JPG_SOF0:
-            case JPG_SOF2:
-            case JPG_SOI:
-            case JPG_SOS:
+            case Marker::JPG_COM:
+            case Marker::JPG_DHP:
+            case Marker::JPG_EXP:
+            case Marker::JPG_DHT:
+            case Marker::JPG_DQT:
+            case Marker::JPG_RST:
+            case Marker::JPG_SOF0:
+            case Marker::JPG_SOF2:
+            case Marker::JPG_SOI:
+            case Marker::JPG_SOS:
                 return true;
             default:
                 return false;
@@ -318,28 +316,28 @@ namespace Gfx {
     }
 
     static inline Marker read_marker_at_cursor (BufferStream& stream) {
-        u16 marker = read_endian_swapped_word(stream);
+        Marker marker = (Marker)read_endian_swapped_word(stream);
         if (stream.handle_read_failure())
-            return JPG_INVALID;
+            return Marker::JPG_INVALID;
         if (is_valid_marker(marker))
             return marker;
-        if (marker != 0xFFFF)
-            return JPG_INVALID;
+        if ((u16)marker != 0xFFFF)
+            return Marker::JPG_INVALID;
         u8 next;
         do {
             stream >> next;
             if (stream.handle_read_failure() || next == 0x00)
-                return JPG_INVALID;
+                return Marker::JPG_INVALID;
         } while (next == 0xFF);
-        marker = 0xFF00 | (u16) next;
-        return is_valid_marker(marker) ? marker : JPG_INVALID;
+        marker = (Marker)(0xFF00 | (u16) next);
+        return is_valid_marker(marker) ? marker : Marker::JPG_INVALID;
     }
 
     void inline print_scan_spec (const JPGLoadingContext& context) {
         dbg() << "Start of Selection: " << context.scan_spec.spectral_start << ", " <<
               "End of Selection: " << context.scan_spec.spectral_end << ", " <<
               "Successive Hi: " << context.scan_spec.approx_hi << ", " <<
-              "Successive Lo: " << context.scan_spec.approx_lo << "!";
+              "Successive Lo: " << context.scan_spec.approx_lo;
     }
 
     static bool read_and_validate_scan_spec (BufferStream& stream, JPGLoadingContext& context) {
@@ -349,12 +347,11 @@ namespace Gfx {
         stream >> successive_approx;
         context.scan_spec.approx_hi = successive_approx >> 4;
         context.scan_spec.approx_lo = successive_approx & 0x0F;
+        context.scan_spec.successive_approx_used = context.scan_spec.approx_hi != 0 || context.scan_spec.approx_lo != 0;
 
         print_scan_spec(context);
 
         if (context.is_progressive) {
-            // TODO: If 4 high order bits of successive_approx is 0, this is the first scan for the band.
-
             if ((context.scan_spec.spectral_start == 0 || context.scan_spec.spectral_end == 0) &&
                 (context.scan_spec.spectral_start != context.scan_spec.spectral_end))
                 return false;
@@ -375,12 +372,12 @@ namespace Gfx {
             if (context.scan_spec.approx_hi != 0 && context.scan_spec.approx_hi != context.scan_spec.approx_lo + 1)
                 return false;
 
-            if (context.scan_spec.spectral_start == 0)
-                context.scan_spec.type = ScanSpec::ScanType::DC_FIRST;
-
+            context.scan_spec.type = context.scan_spec.spectral_start == 0 ? ScanType::DC : ScanType::AC;
+            context.scan_spec.refining = context.scan_spec.successive_approx_used && context.scan_spec.approx_hi != 0;
             return true;
         }
 
+        // For baseline sequential scans, these values must be fixed.
         return context.scan_spec.spectral_start == 0 && context.scan_spec.spectral_end == 63 && successive_approx == 0;
     }
 
@@ -407,6 +404,8 @@ namespace Gfx {
         context.scan_spec.component_count = component_count;
 
         dbg() << "Component in this scan: " << component_count;
+
+        context.scan_spec.components.clear();
 
         for (int i = 0; i < component_count; i++) {
             ComponentSpec* component = nullptr;
@@ -893,49 +892,49 @@ namespace Gfx {
         auto marker = read_marker_at_cursor(stream);
         if (stream.handle_read_failure())
             return false;
-        if (marker != JPG_SOI) {
+        if (marker != Marker::JPG_SOI) {
             dbg() << stream.offset() << String::format(": SOI not found: %x!", marker);
             return false;
         }
         for (;;) {
             marker = read_marker_at_cursor(stream);
             switch (marker) {
-                case JPG_INVALID:
-                case JPG_RST0:
-                case JPG_RST1:
-                case JPG_RST2:
-                case JPG_RST3:
-                case JPG_RST4:
-                case JPG_RST5:
-                case JPG_RST6:
-                case JPG_RST7:
-                case JPG_SOI:
-                case JPG_EOI:
+                case Marker::JPG_INVALID:
+                case Marker::JPG_RST0:
+                case Marker::JPG_RST1:
+                case Marker::JPG_RST2:
+                case Marker::JPG_RST3:
+                case Marker::JPG_RST4:
+                case Marker::JPG_RST5:
+                case Marker::JPG_RST6:
+                case Marker::JPG_RST7:
+                case Marker::JPG_SOI:
+                case Marker::JPG_EOI:
                     dbg() << stream.offset() << String::format(": Unexpected marker %x!", marker);
                     return false;
-                case JPG_SOF2:
+                case Marker::JPG_SOF2:
                     dbg() << "Proceeding to decode progressive JPEG";
                     context.is_progressive = true;
                     [[fallthrough]];
-                case JPG_SOF0:
+                case Marker::JPG_SOF0:
                     dbg() << "Proceeding to decode baseline JPEG";
                     if (!read_start_of_frame(stream, context))
                         return false;
                     context.state = JPGLoadingContext::FrameDecoded;
                     break;
-                case JPG_DQT:
+                case Marker::JPG_DQT:
                     if (!read_quantization_table(stream, context))
                         return false;
                     break;
-                case JPG_RST:
+                case Marker::JPG_RST:
                     if (!read_reset_marker(stream, context))
                         return false;
                     break;
-                case JPG_DHT:
+                case Marker::JPG_DHT:
                     if (!read_huffman_table(stream, context))
                         return false;
                     break;
-                case JPG_SOS:
+                case Marker::JPG_SOS:
                     return read_start_of_scan(stream, context);
                 default:
                     if (!skip_marker_with_length(stream)) {
@@ -959,7 +958,7 @@ namespace Gfx {
             stream >> current_byte;
             if (stream.handle_read_failure()) {
                 dbg() << stream.offset() << ": EOI not found!";
-                return JPG_INVALID;
+                return Marker::JPG_INVALID;
             }
 
             if (last_byte == 0xFF) {
@@ -970,16 +969,16 @@ namespace Gfx {
                     context.huffman_stream.stream.append(last_byte);
                     continue;
                 }
-                Marker marker = 0xFF00 | current_byte;
-                if (marker == JPG_EOI || marker == JPG_DHT || marker == JPG_SOS)
+                Marker marker = (Marker)(0xFF00 | current_byte);
+                if (marker == Marker::JPG_EOI || marker == Marker::JPG_DHT || marker == Marker::JPG_SOS)
                     return marker;
-                if (marker >= JPG_RST0 && marker <= JPG_RST7) {
-                    context.huffman_stream.stream.append(marker);
+                if (marker >= Marker::JPG_RST0 && marker <= Marker::JPG_RST7) {
+                    context.huffman_stream.stream.append((u16)marker);
                     stream >> current_byte;
                     continue;
                 }
                 dbg() << stream.offset() << String::format(": Invalid marker: %x!", marker);
-                return JPG_INVALID;
+                return Marker::JPG_INVALID;
             } else {
                 context.huffman_stream.stream.append(last_byte);
             }
@@ -995,16 +994,16 @@ namespace Gfx {
             return false;
 
         Marker scan_terminator;
-        while ((scan_terminator = scan_huffman_stream(stream, context)) != JPG_EOI) {
-            if (scan_terminator == JPG_INVALID) {
+        while ((scan_terminator = scan_huffman_stream(stream, context)) != Marker::JPG_EOI) {
+            if (scan_terminator == Marker::JPG_INVALID) {
                 dbg() << "Something went wrong while scanning huffman stream!";
                 return false;
             }
-            if (scan_terminator == JPG_SOS) {
+            if (scan_terminator == Marker::JPG_SOS) {
                 dbg() << "Reading new scan segment...";
                 read_start_of_scan(stream, context);
             }
-            if (scan_terminator == JPG_DHT) {
+            if (scan_terminator == Marker::JPG_DHT) {
                 dbg() << "Reading new huffman table specs...";
                 read_huffman_table(stream, context);
             }
