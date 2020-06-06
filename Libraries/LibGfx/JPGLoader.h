@@ -121,6 +121,15 @@ namespace Gfx {
         u32 vpadded_count;
     };
 
+    struct ComponentSpec {
+        i8 id { -1 };
+        u8 hsample_factor { 1 }; // Horizontal sampling factor.
+        u8 vsample_factor { 1 }; // Vertical sampling factor.
+        u8 ac_destination_id;
+        u8 dc_destination_id;
+        u8 qtable_id; // Quantization table id.
+    };
+
     struct ScanSpec {
         enum class ScanType {
             DC_FIRST = 0,
@@ -130,19 +139,12 @@ namespace Gfx {
         };
 
         ScanType type = {ScanType::DC_FIRST};
+        Vector<ComponentSpec*> components;
+        u8 component_count;
         u8 approx_hi;
         u8 approx_lo;
         u8 spectral_start;
         u8 spectral_end;
-    };
-
-    struct ComponentSpec {
-        i8 id { -1 };
-        u8 hsample_factor { 1 }; // Horizontal sampling factor.
-        u8 vsample_factor { 1 }; // Vertical sampling factor.
-        u8 ac_destination_id;
-        u8 dc_destination_id;
-        u8 qtable_id; // Quantization table id.
     };
 
     struct StartOfFrame {

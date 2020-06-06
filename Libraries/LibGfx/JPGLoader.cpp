@@ -362,7 +362,9 @@ namespace Gfx {
             if (context.scan_spec.spectral_start > context.scan_spec.spectral_end)
                 return false;
 
-            // TODO: If the spectral selection start is not 0, the scan may only contain one component.
+            // AC scans should always be non-interleaved.
+            if (context.scan_spec.spectral_start != 0 && context.scan_spec.component_count != 1)
+                return false;
 
             if (context.scan_spec.spectral_end > 63)
                 return false;
@@ -373,10 +375,8 @@ namespace Gfx {
             if (context.scan_spec.approx_hi != 0 && context.scan_spec.approx_hi != context.scan_spec.approx_lo + 1)
                 return false;
 
-            if (context.scan_spec.spectral_start == 0) {
-                dbg() << "First DC scan";
+            if (context.scan_spec.spectral_start == 0)
                 context.scan_spec.type = ScanSpec::ScanType::DC_FIRST;
-            }
 
             return true;
         }
@@ -393,15 +393,18 @@ namespace Gfx {
         u16 bytes_to_read = read_endian_swapped_word(stream);
         if (stream.handle_read_failure())
             return false;
+
         bytes_to_read -= 2;
         if (!bounds_okay(stream.offset(), bytes_to_read, context.compressed_size))
             return false;
+
         u8 component_count;
         stream >> component_count;
         if (component_count > context.component_count) {
             dbg() << stream.offset() << String::format(": Unsupported number of components: %i!", component_count);
             return false;
         }
+        context.scan_spec.component_count = component_count;
 
         dbg() << "Component in this scan: " << component_count;
 
@@ -426,6 +429,7 @@ namespace Gfx {
             stream >> table_ids;
             component->dc_destination_id = table_ids >> 4;
             component->ac_destination_id = table_ids & 0x0F;
+            context.scan_spec.components.append(component);
         }
 
         return read_and_validate_scan_spec(stream, context);
