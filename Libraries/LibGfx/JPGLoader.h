@@ -148,13 +148,7 @@ namespace Gfx {
         u8 approx_lo;
     };
 
-    struct StartOfFrame {
-        enum class FrameType {
-            Baseline = 0
-            // Progressive = 1
-        };
-
-        FrameType type { FrameType::Baseline };
+    struct FrameSpec {
         u8 precision;
         u16 height;
         u16 width;
@@ -189,7 +183,8 @@ namespace Gfx {
         u32 chroma_table[64];
         bool is_progressive { false };
         ScanSpec scan_spec;
-        StartOfFrame frame;
+        MacroblockMeta block_meta; // Macroblock meta.
+        FrameSpec frame;
         u8 hsample_factor;
         u8 vsample_factor;
         bool has_zero_based_ids;
@@ -201,7 +196,6 @@ namespace Gfx {
         Vector<HuffmanTableSpec> ac_tables;
         HuffmanStreamState huffman_stream;
         i32 previous_dc_values[3] = { 0 };
-        MacroblockMeta mblock_meta; // Macroblock meta
     };
 
     class JPGImageDecoderPlugin final : public ImageDecoderPlugin {
