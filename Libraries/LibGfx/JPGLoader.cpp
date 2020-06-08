@@ -34,13 +34,8 @@
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/JPGLoader.h>
 #include <Libraries/LibM/math.h>
-#include <AK/HashMap.h>
 
 namespace Gfx {
-
-    static bool load_jpg_impl (JPGLoadingContext&);
-    RefPtr<Gfx::Bitmap> load_jpg (const StringView& path);
-    RefPtr<Gfx::Bitmap> load_jpg_from_memory (const u8*, size_t);
 
     static const u8 zigzag_map[64] {
         0, 1, 8, 16, 9, 2, 3, 10,
@@ -123,7 +118,7 @@ namespace Gfx {
         // DC coefficients are encoded as the difference between previous and current DC values.
         i32 dc_diff = coeff_or_error.release_value();
 
-        // If MSB in diff is 0, the difference is -ve. Otherwise +ve.
+        // // Equivalent of EXTEND from the spec (Annex F.2.2.1).
         if (dc_length != 0 && dc_diff < (1 << (dc_length - 1)))
             dc_diff -= (1 << dc_length) - 1;
 
@@ -138,7 +133,6 @@ namespace Gfx {
         i32* select_component = component.id == 1 ? block.y : (component.id == 2 ? block.cb : block.cr);
         auto bit_or_error = read_huffman_bits(context.huffman_stream, 1);
         if (!bit_or_error.has_value()) return false;
-        // FIXME: I'm not sure about this.
         select_component[0] |= (bit_or_error.value() << context.scan_spec.approx_lo);
         return true;
     }
@@ -157,20 +151,17 @@ namespace Gfx {
             //  before reading the coefficient. Low 4 bits represent the magnitude of the coefficient.
             auto ac_symbol = symbol_or_error.release_value();
             if (ac_symbol == 0) {
-                while (j <= context.scan_spec.spectral_end)
-                    select_component[zigzag_map[j++]] = 0;
+                j = context.scan_spec.spectral_end;
                 return true;
             }
 
             // ac_symbol = 0xF0 means we need to skip 16 zeroes.
-            auto run_length = ac_symbol == 0xF0 ? 16 : ac_symbol >> 4;
-            if (j + run_length > context.scan_spec.spectral_end) {
+            u8 run_length = ac_symbol == 0xF0 ? 16 : ac_symbol >> 4;
+            j += run_length;
+            if (j > context.scan_spec.spectral_end) {
                 dbg() << String::format("Run-length exceeded boundaries. Cursor: %d, Skipping: %d!", j, run_length);
                 return false;
             }
-
-            for (int k = 0; k < run_length; k++)
-                select_component[zigzag_map[j++]] = 0;
 
             u8 coeff_length = ac_symbol & 0x0F;
             if (coeff_length > 10) {
@@ -182,10 +173,20 @@ namespace Gfx {
                 auto coeff_or_error = read_huffman_bits(context.huffman_stream, coeff_length);
                 if (!coeff_or_error.has_value()) return {};
                 i32 ac_coefficient = coeff_or_error.release_value();
+                // Equivalent of EXTEND from the spec (Annex F.2.2.1).
                 if (ac_coefficient < (1 << (coeff_length - 1)))
                     ac_coefficient -= (1 << coeff_length) - 1;
-                // FIXME?
-                select_component[zigzag_map[j++]] = ac_coefficient / (1 << context.scan_spec.approx_lo);
+                select_component[zigzag_map[j++]] = ac_coefficient << context.scan_spec.approx_lo;
+            } else {
+                // coeff_length == 0...check for EOB.
+                if (context.is_progressive) {
+                    if (run_length < 15) {
+                        auto eob_or_error = read_huffman_bits(context.huffman_stream, run_length);
+                        if (!eob_or_error.has_value()) return false;
+                        context.scan_spec.end_of_band = eob_or_error.value() + (1 << run_length) - 1;
+                        return true;
+                    }
+                }
             }
         }
 
@@ -194,27 +195,45 @@ namespace Gfx {
 
     bool refine_and_store_ac (const ComponentSpec& component, Macroblock& block, JPGLoadingContext& context) {
         i32* select_component = component.id == 1 ? block.y : (component.id == 2 ? block.cb : block.cr);
-        auto bit_or_error = read_huffman_bits(context.huffman_stream, 1);
-        if (!bit_or_error.has_value()) return false;
-        select_component[0] = (select_component[0] << 1) | bit_or_error.value();
+        const HuffmanTableSpec& table_spec = context.ac_tables[component.ac_destination_id];
+        auto symbol_or_error = get_next_symbol(context.huffman_stream, table_spec);
+        if (!symbol_or_error.has_value()) return false;
+        u8 coeff_length = symbol_or_error.value() & 0x0F;
+        if (coeff_length == 1) {
+
+        }
+
+        select_component[0] = (select_component[0] << 1) | symbol_or_error.value();
         return true;
     }
 
-    bool build_macroblocks (Vector<Macroblock>& macroblocks, JPGLoadingContext& context, u8 hcursor, u8 vcursor) {
+    bool decode_mcu (Vector<Macroblock>& macroblocks, JPGLoadingContext& context, u8 hcursor, u8 vcursor) {
         for (u32 cindex = 0; cindex < context.scan_spec.component_count; cindex++) {
             auto& component = context.components[cindex];
-            for (u8 vfactor_i = 0; vfactor_i < component.vertical_sampling; vfactor_i++) {
-                for (u8 hfactor_i = 0; hfactor_i < component.horizontal_sampling; hfactor_i++) {
-                    auto& block = macroblocks[(vcursor + vfactor_i) * context.block_meta.hpadded_count + (hfactor_i + hcursor)];
+            for (u8 i = 0; i < component.vertical_sampling; i++) {
+                for (u8 j = 0; j < component.horizontal_sampling; j++) {
+                    size_t index = (vcursor + i) * context.block_meta.hpadded_count + (j + hcursor);
+                    auto& block = macroblocks[index];
+                    
                     if (context.is_progressive) {
                         if (context.scan_spec.type == ScanType::DC) {
-                            if ((context.scan_spec.refining && !refine_and_store_dc(component, block, context)) ||
-                                !decode_and_store_dc(component, block, context))
-                                return false;
+                            bool success = context.scan_spec.refining
+                                ? refine_and_store_dc(component, block, context) 
+                                : decode_and_store_dc(component, block, context);
+                            if (!success) return false;
                         } else {
-                            if ((context.scan_spec.refining && !refine_and_store_ac(component, block, context)) ||
-                                !decode_and_store_ac(component, block, context))
-                                return false;
+                            // AC decode.
+                            if (context.scan_spec.refining) {
+                                if (!refine_and_store_ac(component, block, context))
+                                    return false;
+                            } else {
+                                if (context.scan_spec.end_of_band != 0) {
+                                    context.scan_spec.end_of_band--;
+                                    return true;
+                                }
+                                if (!decode_and_store_ac(component, block, context))
+                                    return false;
+                            }
                         }
                     }
                     else {
@@ -227,7 +246,6 @@ namespace Gfx {
                 }
             }
         }
-
         return true;
     }
 
@@ -244,6 +262,8 @@ namespace Gfx {
                 u32 i = vcursor * context.block_meta.hpadded_count + hcursor;
                 if (context.dc_reset_interval > 0) {
                     if (i % context.dc_reset_interval == 0) {
+                        context.scan_spec.end_of_band = 0;
+
                         for (ComponentSpec* spec : context.scan_spec.components)
                             context.previous_dc_values[spec->id - 1] = 0;
 
@@ -260,8 +280,8 @@ namespace Gfx {
                     }
                 }
 
-                if (!build_macroblocks(macroblocks, context, hcursor, vcursor)) {
-                    dbg() << "Failed to build Macroblock " << i + 1;
+                if (!decode_mcu(macroblocks, context, hcursor, vcursor)) {
+                    dbg() << "Failed to decode MCU " << i << "!";
                     dbg() << "Huffman stream byte offset " << context.huffman_stream.byte_offset;
                     dbg() << "Huffman stream bit offset " << context.huffman_stream.bit_offset;
                     return false;
@@ -327,13 +347,6 @@ namespace Gfx {
         return is_valid_marker(marker) ? marker : Marker::JPG_INVALID;
     }
 
-    void inline print_scan_spec (const JPGLoadingContext& context) {
-        dbg() << "Spectral Start: " << context.scan_spec.spectral_start << ", " <<
-              "Spectral End: " << context.scan_spec.spectral_end << ", " <<
-              "Successive Hi: " << context.scan_spec.approx_hi << ", " <<
-              "Successive Lo: " << context.scan_spec.approx_lo;
-    }
-
     static bool read_and_validate_scan_spec (BufferStream& stream, JPGLoadingContext& context) {
         stream >> context.scan_spec.spectral_start;
         stream >> context.scan_spec.spectral_end;
@@ -343,7 +356,10 @@ namespace Gfx {
         context.scan_spec.approx_lo = successive_approx & 0x0F;
         context.scan_spec.successive_approx_used = context.scan_spec.approx_hi != 0 || context.scan_spec.approx_lo != 0;
 
-        print_scan_spec(context);
+        dbg() << "Spectral Start: " << context.scan_spec.spectral_start << ", " <<
+              "Spectral End: " << context.scan_spec.spectral_end << ", " <<
+              "Successive Hi: " << context.scan_spec.approx_hi << ", " <<
+              "Successive Lo: " << context.scan_spec.approx_lo;
 
         if (context.is_progressive) {
             if ((context.scan_spec.spectral_start == 0 || context.scan_spec.spectral_end == 0) &&
@@ -546,7 +562,8 @@ namespace Gfx {
         context.frame.height = read_endian_swapped_word(stream);
         context.frame.width = read_endian_swapped_word(stream);
         if (!context.frame.width || !context.frame.height) {
-            dbg() << stream.offset() << ": ERROR! Image height: " << context.frame.height << ", Image width: " << context.frame.width << "!";
+            dbg() << stream.offset() << ": Invalid image dimensions!";
+            dbg() << "Height: " << context.frame.height << ", Width: " << context.frame.width << "!";
             return false;
         }
         set_macroblock_metadata(context);
@@ -651,9 +668,9 @@ namespace Gfx {
                 for (u8 cindex = 0; cindex < context.component_count; cindex++) {
                     auto& component = context.components[cindex];
                     const u32* table = component.qtable_id == 0 ? context.luma_table : context.chroma_table;
-                    for (u32 vfactor_i = 0; vfactor_i < component.vertical_sampling; vfactor_i++) {
-                        for (u32 hfactor_i = 0; hfactor_i < component.horizontal_sampling; hfactor_i++) {
-                            u32 macroblock_index = (vcursor + vfactor_i) * context.block_meta.hpadded_count + (hfactor_i + hcursor);
+                    for (u32 i = 0; i < component.vertical_sampling; i++) {
+                        for (u32 j = 0; j < component.horizontal_sampling; j++) {
+                            u32 macroblock_index = (vcursor + i) * context.block_meta.hpadded_count + (j + hcursor);
                             Macroblock& block = macroblocks[macroblock_index];
                             int* block_component = cindex == 0 ? block.y : (cindex == 1 ? block.cb : block.cr);
                             for (u32 k = 0; k < 64; k++)
@@ -686,9 +703,9 @@ namespace Gfx {
             for (u32 hcursor = 0; hcursor < context.block_meta.hcount; hcursor += context.horizontal_sampling) {
                 for (u8 cindex = 0; cindex < context.component_count; cindex++) {
                     auto& component = context.components[cindex];
-                    for (u8 vfactor_i = 0; vfactor_i < component.vertical_sampling; vfactor_i++) {
-                        for (u8 hfactor_i = 0; hfactor_i < component.horizontal_sampling; hfactor_i++) {
-                            u32 macroblock_index = (vcursor + vfactor_i) * context.block_meta.hpadded_count + (hfactor_i + hcursor);
+                    for (u8 i = 0; i < component.vertical_sampling; i++) {
+                        for (u8 j = 0; j < component.horizontal_sampling; j++) {
+                            u32 macroblock_index = (vcursor + i) * context.block_meta.hpadded_count + (j + hcursor);
                             Macroblock& block = macroblocks[macroblock_index];
                             i32* block_component = cindex == 0 ? block.y : (cindex == 1 ? block.cb : block.cr);
                             for (u32 k = 0; k < 8; ++k) {
@@ -910,8 +927,7 @@ namespace Gfx {
                     [[fallthrough]];
                 case Marker::JPG_SOF0:
                     if (context.is_progressive)
-                        dbg() << "Proceeding to decode progressive JPEG...";
-                    else dbg() << "Proceeding to decode baseline JPEG...";
+                        dbg() << "Proceeding to decode " << (context.is_progressive ? "progressive" : "baseline") << " JPEG...";
                     if (!read_start_of_frame(stream, context))
                         return false;
                     context.state = JPGLoadingContext::FrameDecoded;

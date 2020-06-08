@@ -116,10 +116,10 @@ namespace Gfx {
     struct MacroblockMeta {
         u32 total;
         u32 padded_total;
-        u32 hcount;
-        u32 vcount;
-        u32 hpadded_count; // Horizontal macroblock count after padding.
-        u32 vpadded_count; // Vertical macroblock count after padding.
+        u32 hcount; // Macroblocks in a line.
+        u32 vcount; // Lines of macroblocks.
+        u32 hpadded_count; // Macroblocks in a line after filling partial MCUs horizontally.
+        u32 vpadded_count; // Lines of macroblocks after filling partial MCUs vertically.
     };
 
     struct ComponentSpec {
@@ -142,6 +142,7 @@ namespace Gfx {
         u8 component_count;
         u8 spectral_start;
         u8 spectral_end;
+        int end_of_band = { 0 };
         bool successive_approx_used { false };
         bool refining { false };
         u8 approx_hi;
@@ -176,7 +177,7 @@ namespace Gfx {
             BitmapDecoded
         };
 
-        State state{State::NotDecoded};
+        State state { State::NotDecoded };
         const u8* compressed_data { nullptr };
         size_t compressed_size { 0 };
         u32 luma_table[64];
