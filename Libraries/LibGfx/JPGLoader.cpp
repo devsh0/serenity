@@ -34,6 +34,7 @@
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/JPGLoader.h>
 #include <Libraries/LibM/math.h>
+#include <AK/StringBuilder.h>
 
 namespace Gfx {
 
@@ -141,29 +142,43 @@ namespace Gfx {
         i32* select_component = component.id == 1 ? block.y : (component.id == 2 ? block.cb : block.cr);
         const HuffmanTableSpec& table_spec = context.ac_tables[component.ac_destination_id];
 
+        if (context.is_progressive && context.scan_spec.end_of_band > 0) {
+            context.scan_spec.end_of_band--;
+            return true;
+        }
+
         // DC coefficient is already decoded if this is a baseline JPEG. In that case, we should start from 1.
         u8 j = context.is_progressive ? context.scan_spec.spectral_start : 1;
-        while (j <= context.scan_spec.spectral_end) {
+        for (;j <= context.scan_spec.spectral_end; j += (u8)context.is_progressive) {
             auto symbol_or_error = get_next_symbol(context.huffman_stream, table_spec);
             if (!symbol_or_error.has_value()) return false;
 
-            // AC symbols encode 2 pieces of information. The high 4 bits represent number of zeroes to be stuffed
-            //  before reading the coefficient. Low 4 bits represent the magnitude of the coefficient.
             auto ac_symbol = symbol_or_error.release_value();
-            if (ac_symbol == 0) {
-                j = context.scan_spec.spectral_end;
+            if (ac_symbol == 0)
                 return true;
-            }
 
             // ac_symbol = 0xF0 means we need to skip 16 zeroes.
             u8 run_length = ac_symbol == 0xF0 ? 16 : ac_symbol >> 4;
+            u8 coeff_length = ac_symbol & 0x0F;
+
+            if (context.is_progressive && coeff_length == 0) {
+                if (run_length != 16 && run_length != 0) {
+                    auto eob_or_error = read_huffman_bits(context.huffman_stream, run_length);
+                    if (!eob_or_error.has_value()) {
+                        dbg() << "Checkpoint 2";
+                        return false;
+                    }
+                    context.scan_spec.end_of_band = (1 << run_length) + eob_or_error.value() - 1;
+                    return true;
+                }
+            }
+
             j += run_length;
-            if (j > context.scan_spec.spectral_end) {
+            if (!context.is_progressive && j > context.scan_spec.spectral_end) {
                 dbg() << String::format("Run-length exceeded boundaries. Cursor: %d, Skipping: %d!", j, run_length);
                 return false;
             }
 
-            u8 coeff_length = ac_symbol & 0x0F;
             if (coeff_length > 10) {
                 dbg() << String::format("AC coefficient too long: %d!", coeff_length);
                 return false;
@@ -171,39 +186,91 @@ namespace Gfx {
 
             if (coeff_length > 0) {
                 auto coeff_or_error = read_huffman_bits(context.huffman_stream, coeff_length);
-                if (!coeff_or_error.has_value()) return {};
+                if (!coeff_or_error.has_value()) {
+                    dbg() << "Checkpoint 3";
+                    return false;
+                }
                 i32 ac_coefficient = coeff_or_error.release_value();
                 // Equivalent of EXTEND from the spec (Annex F.2.2.1).
                 if (ac_coefficient < (1 << (coeff_length - 1)))
                     ac_coefficient -= (1 << coeff_length) - 1;
                 select_component[zigzag_map[j++]] = ac_coefficient << context.scan_spec.approx_lo;
-            } else {
-                // coeff_length == 0...check for EOB.
-                if (context.is_progressive) {
-                    if (run_length < 15) {
-                        auto eob_or_error = read_huffman_bits(context.huffman_stream, run_length);
-                        if (!eob_or_error.has_value()) return false;
-                        context.scan_spec.end_of_band = eob_or_error.value() + (1 << run_length) - 1;
-                        return true;
-                    }
-                }
             }
         }
 
         return true;
     }
 
-    bool refine_and_store_ac (const ComponentSpec& component, Macroblock& block, JPGLoadingContext& context) {
-        i32* select_component = component.id == 1 ? block.y : (component.id == 2 ? block.cb : block.cr);
-        const HuffmanTableSpec& table_spec = context.ac_tables[component.ac_destination_id];
-        auto symbol_or_error = get_next_symbol(context.huffman_stream, table_spec);
-        if (!symbol_or_error.has_value()) return false;
-        u8 coeff_length = symbol_or_error.value() & 0x0F;
-        if (coeff_length == 1) {
+    int refine_ac (int coefficient, JPGLoadingContext& context) {
+        if (coefficient > 0) {
+            auto bits_or_error = read_huffman_bits(context.huffman_stream);
+            if (!bits_or_error.has_value()) return false;
+            if (bits_or_error.value() != 0)
+                coefficient = coefficient + (1 << context.scan_spec.approx_lo);
+        }
+        else if (coefficient < 0) {
+            auto bits_or_error = read_huffman_bits(context.huffman_stream);
+            if (!bits_or_error.has_value()) return false;
+            if (bits_or_error.value() != 0) {
+                coefficient = coefficient + (1 << context.scan_spec.approx_lo) * -1;
+            }
+        }
+        return coefficient;
+    }
 
+    bool refine_and_store_ac (const ComponentSpec& component, Macroblock& block, JPGLoadingContext& context) {
+        i32* coefficients = component.id == 1 ? block.y : (component.id == 2 ? block.cb : block.cr);
+        const HuffmanTableSpec& table_spec = context.ac_tables[component.ac_destination_id];
+
+        size_t j = context.scan_spec.spectral_start;
+        while (j <= context.scan_spec.spectral_end) {
+            if (context.scan_spec.end_of_band > 0) {
+                while (j <= context.scan_spec.spectral_end) {
+                    if (coefficients[j] != 0) {
+                        coefficients[j] = refine_ac(coefficients[j], context);
+                        j++;
+                    }
+                }
+                context.scan_spec.end_of_band--;
+                return true;
+            }
+
+            auto value_or_error = get_next_symbol(context.huffman_stream, table_spec);
+            if (!value_or_error.has_value()) return false;
+            int value = value_or_error.release_value();
+            int lobits = value & 0x0F;
+            int hibits = (value & 0xF0) >> 4;
+            if (lobits == 1) {
+                auto extra_or_error = read_huffman_bits(context.huffman_stream);
+                if (!extra_or_error.has_value()) return false;
+                int extrabit = extra_or_error.release_value();
+                while (hibits > 0 || coefficients[j] != 0) {
+                    if (coefficients[j] != 0)
+                        coefficients[j] = refine_ac(coefficients[j], context);
+                    else hibits--;
+                    j++;
+                }
+                if (extrabit != 0)
+                    coefficients[j] = 1 << context.scan_spec.approx_lo;
+                else coefficients[j] = -1 * (1 << context.scan_spec.approx_lo);
+                j++;
+            }
+            else if (lobits == 0) {
+                while (hibits >= 0) {
+                    if (coefficients[j] != 0)
+                        coefficients[j] = refine_ac(coefficients[j], context);
+                    else hibits--;
+                }
+            }
+            else if (hibits == 0)
+                context.scan_spec.end_of_band = 1;
+            else {
+                auto tmp_or_error = read_huffman_bits(context.huffman_stream, hibits);
+                if (!tmp_or_error.has_value()) return false;
+                context.scan_spec.end_of_band = (1 << hibits) + tmp_or_error.release_value();
+            }
         }
 
-        select_component[0] = (select_component[0] << 1) | symbol_or_error.value();
         return true;
     }
 
@@ -227,10 +294,6 @@ namespace Gfx {
                                 if (!refine_and_store_ac(component, block, context))
                                     return false;
                             } else {
-                                if (context.scan_spec.end_of_band != 0) {
-                                    context.scan_spec.end_of_band--;
-                                    return true;
-                                }
                                 if (!decode_and_store_ac(component, block, context))
                                     return false;
                             }
@@ -289,6 +352,7 @@ namespace Gfx {
             }
         }
 
+        dbg() << "Stream Size: " << context.huffman_stream.stream.size() << ", Byte offset: " << context.huffman_stream.byte_offset;
         return true;
     }
 
@@ -959,6 +1023,10 @@ namespace Gfx {
     }
 
     static Marker scan_huffman_stream (BufferStream& stream, JPGLoadingContext& context) {
+        context.huffman_stream.stream.clear();
+        context.huffman_stream.byte_offset = 0;
+        context.huffman_stream.bit_offset = 0;
+
         u8 last_byte;
         u8 current_byte;
         stream >> current_byte;
