@@ -29,6 +29,7 @@
 #include <AK/ByteBuffer.h>
 #include <AK/String.h>
 #include <AK/StringView.h>
+#include <AK/Vector.h>
 
 namespace AK {
 
@@ -335,6 +336,16 @@ public:
             return 0;
         }
         return m_buffer[m_offset];
+    }
+
+    Vector<u8> peek(size_t count)
+    {
+        size_t old_offset = m_offset;
+        Vector<u8> buffer;
+        buffer.resize(count);
+        read_raw(buffer.data(), count);
+        m_offset = old_offset;
+        return move(buffer);
     }
 
     BufferStream& operator>>(String& str)
