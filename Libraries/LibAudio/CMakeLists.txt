@@ -1,5 +1,7 @@
 set(SOURCES
     ClientConnection.cpp
+    ID3v2Parser.cpp
+    MpegAudioLoader.cpp
     WavLoader.cpp
     WavWriter.cpp
 )
