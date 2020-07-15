@@ -76,7 +76,7 @@ public:
 
     // These functions will read relative to the bit cursor. They won't align
     //  the cursor to the first bit of the next byte before reading a value.
-    size_t read_network_order_uint(size_t bit_count)
+    ALWAYS_INLINE size_t read_network_order_bits(size_t bit_count)
     {
         if (bit_count > (sizeof(size_t) * 8) || !ensure_bits(bit_count)) {
             set_failed();
@@ -100,27 +100,27 @@ public:
         return number;
     }
 
-    u8 read_u8()
+    inline u8 read_u8()
     {
-        return (u8)read_network_order_uint(8);
+        return (u8)read_network_order_bits(8);
     }
 
-    u16 read_network_order_u16()
+    inline u16 read_network_order_u16()
     {
-        return (u16)read_network_order_uint(16);
+        return (u16)read_network_order_bits(16);
     }
 
-    u32 read_network_order_u32()
+    inline u32 read_network_order_u32()
     {
-        return (u32)read_network_order_uint(32);
+        return (u32)read_network_order_bits(32);
     }
 
-    u64 read_network_order_u64()
+    inline u64 read_network_order_u64()
     {
-        return (u64)read_network_order_uint(64);
+        return (u64)read_network_order_bits(64);
     }
 
-    bool handle_read_failure()
+    inline bool handle_read_failure()
     {
         bool old = m_failed;
         m_failed = false;
@@ -213,7 +213,7 @@ public:
 
     void skip_bits(size_t amount)
     {
-        read_network_order_uint(amount);
+        read_network_order_bits(amount);
     }
 
     BinaryStream& skip_bytes(size_t amount)
