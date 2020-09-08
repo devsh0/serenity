@@ -161,8 +161,7 @@ static size_t parse_tag_header(BinaryStream& stream, MpegAudioContext& context)
         return 0;
 
     StringBuilder builder;
-    builder.append(context.id3_string);
-    builder.append('.');
+    builder.append("ID3v2.");
     builder.append('0' + minor);
     builder.append('.');
     builder.append('0' + revision);

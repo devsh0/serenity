@@ -27,12 +27,12 @@
 #include "MpegAudioLoader.h"
 #include "ID3v2Parser.h"
 
-#define MPEG_debug 1
+#define MPEG_DEBUG 1
 #define debug_fmt(fmt, args...) \
-    if (MPEG_debug)             \
+    if (MPEG_DEBUG)             \
     dbg() << String::format(fmt, args)
 #define debug(arg)  \
-    if (MPEG_debug) \
+    if (MPEG_DEBUG) \
     dbg() << arg
 
 namespace Audio {
@@ -68,22 +68,23 @@ static constexpr u32 frequency_index[3][3] = {
     { 32000, 16000, 8000 }
 };
 
-bool MpegAudioLoader::is_bad_frame_header()
+bool MpegAudioLoader::is_frame_header_corrupted()
 {
-    FrameSpec& frame_spec = m_context.frame_spec;
-    if (frame_spec.is_protected) {
-        m_stream >> frame_spec.crc[0] >> frame_spec.crc[1];
+    FrameSpec& spec = m_context.frame_spec;
+    if (spec.is_protected) {
+        m_stream >> spec.crc[0] >> spec.crc[1];
         if (m_stream.handle_read_failure())
             return true;
     }
+    // TODO: CRC16 validation.
 
-    // TODO: CRC check.
-
-    if (frame_spec.layer != 2)
+    // These constraints are only applicable if we're dealing with layer 2 audio.
+    if (spec.layer != 2)
         return false;
 
-    if (frame_spec.channel_mode == CHANNEL_MODE::MONO) {
-        switch (frame_spec.bitrate) {
+    // Bitrates not allowed in layer 2 MONO.
+    if (spec.channel_mode == CHANNEL_MODE::MONO) {
+        switch (spec.bitrate) {
         case 224000:
         case 256000:
         case 320000:
@@ -92,21 +93,18 @@ bool MpegAudioLoader::is_bad_frame_header()
         }
     }
 
-    if (frame_spec.channel_mode == CHANNEL_MODE::STEREO
-        || frame_spec.channel_mode == CHANNEL_MODE::DUAL
-        || frame_spec.channel_mode == CHANNEL_MODE::JOINT_STEREO) {
-        switch (frame_spec.bitrate) {
+    // Bitrates not allowed in layer 2 DUAL/STEREO.
+    if (spec.channel_mode == CHANNEL_MODE::STEREO || spec.channel_mode == CHANNEL_MODE::DUAL || spec.channel_mode == CHANNEL_MODE::JOINT_STEREO) {
+        switch (spec.bitrate) {
         case 32000:
         case 48000:
         case 56000:
         case 80000:
-            if (frame_spec.channel_mode == CHANNEL_MODE::STEREO
-                || frame_spec.channel_mode == CHANNEL_MODE::DUAL)
+            if (spec.channel_mode == CHANNEL_MODE::STEREO || spec.channel_mode == CHANNEL_MODE::DUAL)
                 return true;
 
             // Bitrates not allowed only in intensity stereo mode.
-            if (frame_spec.mode_extension.stereo_descriptor == 0x01
-                || frame_spec.mode_extension.stereo_descriptor == 0x03)
+            if (spec.mode_extension.stereo_descriptor == 0x01 || spec.mode_extension.stereo_descriptor == 0x03)
                 return true;
         }
     }
@@ -114,10 +112,10 @@ bool MpegAudioLoader::is_bad_frame_header()
     return false;
 }
 
-inline bool MpegAudioLoader::read_bitrate()
+inline bool MpegAudioLoader::bitrate_read_helper()
 {
     FrameSpec& frame_spec = m_context.frame_spec;
-    auto bitrate_descriptor = m_stream.read_network_order_uint(4);
+    auto bitrate_descriptor = m_stream.read_network_order_bits(4);
     if (bitrate_descriptor <= 0x00 || bitrate_descriptor >= 0x0F) {
         dbg() << String::format("%d: invalid bitrate descriptor: %d", m_stream.offset(), bitrate_descriptor);
         return false;
@@ -134,23 +132,24 @@ bool MpegAudioLoader::read_frame_header()
         return false;
     }
 
-    if (m_stream.read_u8() != 0xFF || m_stream.read_network_order_uint(3) < 0x07) {
+    if (m_stream.read_u8() != 0xFF || m_stream.read_network_order_bits(3) < 0x07) {
         dbg() << String::format("%d: invalid sync word!", m_stream.offset());
         return false;
     }
 
+    // Frame headers in the audio file don't differ much from the first frame.
     if (frame_spec.mpeg_version != 0) {
-        // Frame headers in the audio file remain identical to the first frame except the bitrate and maybe padding.
         m_stream.skip_bits(5);
-        if (!read_bitrate()) // 4 bits.
+        // Read bitrate (4 bits).
+        if (!bitrate_read_helper())
             return false;
         m_stream.skip_bits(2);
-        frame_spec.has_padding = (u8)m_stream.read_network_order_uint(1) != 0;
+        frame_spec.has_padding = (u8)m_stream.read_network_order_bits(1) != 0;
         m_stream.skip_bits(9);
         return true;
     }
 
-    auto version_descriptor = m_stream.read_network_order_uint(2);
+    auto version_descriptor = m_stream.read_network_order_bits(2);
     switch (version_descriptor) {
     case 0x00:
         frame_spec.is_mpeg25 = true;
@@ -166,48 +165,50 @@ bool MpegAudioLoader::read_frame_header()
         return false;
     }
 
-    auto layer_descriptor = m_stream.read_network_order_uint(2);
+    auto layer_descriptor = m_stream.read_network_order_bits(2);
     if (layer_descriptor > 3) {
         dbg() << String::format("%d: unknown layer descriptor=%d", m_stream.offset(), layer_descriptor);
         return false;
     }
     frame_spec.layer = (u8)(4 - layer_descriptor);
-
-    frame_spec.is_protected = m_stream.read_network_order_uint(1) == 0;
+    frame_spec.is_protected = m_stream.read_network_order_bits(1) == 0;
 
     // Read bitrate (4 bits).
-    if (!read_bitrate())
+    if (!bitrate_read_helper())
         return false;
-
-    auto frequency_descriptor = m_stream.read_network_order_uint(2);
+    auto frequency_descriptor = m_stream.read_network_order_bits(2);
     frame_spec.sample_rate = frequency_index[frequency_descriptor][(frame_spec.mpeg_version + frame_spec.is_mpeg25) - 1];
 
-    frame_spec.has_padding = (u8)m_stream.read_network_order_uint(1) != 0;
+    // Frame is padded with 1 extra byte if the padding bit is NOT set.
+    frame_spec.has_padding = (u8)m_stream.read_network_order_bits(1) != 0;
 
     // Ignore private bit.
     m_stream.skip_bits(1);
-
-    auto channel_descriptor = m_stream.read_network_order_uint(2);
+    auto channel_descriptor = m_stream.read_network_order_bits(2);
     if (channel_descriptor > 0x03) {
         dbg() << String::format("%d: invalid channel descriptor!", m_stream.offset());
         return false;
     }
     frame_spec.channel_mode = (CHANNEL_MODE)channel_descriptor;
-
-    frame_spec.mode_extension.frequency_range_descriptor = (u8)m_stream.read_network_order_uint(2);
-    if (frame_spec.mode_extension.frequency_range_descriptor > 0x03) {
-        dbg() << String::format("%d: unknown mode extension descriptor=%d", m_stream.offset(), frame_spec.mode_extension.frequency_range_descriptor);
+    u8 frd = (u8)m_stream.read_network_order_bits(2);
+    if (frd > 0x03) {
+        dbg() << String::format("%d: unknown mode extension descriptor=%d", m_stream.offset(), frd);
         return false;
     }
-
-    frame_spec.is_copyright_protected = (u8)m_stream.read_network_order_uint(1);
-    frame_spec.is_original = m_stream.read_network_order_uint(1) != 0;
-    frame_spec.emphasis_descriptor = (u8)m_stream.read_network_order_uint(2);
+    frame_spec.mode_extension.frequency_range_descriptor = frd;
+    frame_spec.is_copyright_protected = (u8)m_stream.read_network_order_bits(1);
+    frame_spec.is_original = m_stream.read_network_order_bits(1) != 0;
+    frame_spec.emphasis_descriptor = (u8)m_stream.read_network_order_bits(2);
     return true;
 }
 
 bool MpegAudioLoader::read_side_info()
 {
+    static constexpr u8 scalefactor_compress_index[16][2] = {
+        { 0, 0 }, { 0, 1 }, { 0, 2 }, { 0, 3 }, { 3, 0 }, { 1, 1 }, { 1, 2 }, { 1, 3 },
+        { 2, 1 }, { 2, 2 }, { 2, 3 }, { 3, 1 }, { 3, 2 }, { 3, 3 }, { 4, 2 }, { 4, 3 }
+    };
+
     FrameSpec& frame_spec = m_context.frame_spec;
     bool is_mono = frame_spec.channel_mode == CHANNEL_MODE::MONO;
     if (!m_stream.ensure_bytes(is_mono ? 17 : 32)) {
@@ -217,18 +218,69 @@ bool MpegAudioLoader::read_side_info()
 
     int channel_count = is_mono ? 1 : 2;
 
-    frame_spec.main_data_begin = (u16)m_stream.read_network_order_uint(9);
+    frame_spec.main_data_begin = (u16)m_stream.read_network_order_bits(9);
 
     // Skip private info bits.
     m_stream.skip_bits(is_mono ? 5 : 3);
 
-    // Scale factor sharing policies for each band.
-    for (int i = 0; i < channel_count; i++) {
-        bool* channel = frame_spec.sfs_policy_index[i];
-        for (int j = 0; j < 4; j++)
-            channel[j] = m_stream.read_network_order_uint(1) != 0;
+    // Scale factor sharing policies for each subband.
+    for (int channel = 0; channel < channel_count; channel++) {
+        bool* ch_ptr = frame_spec.scfsi[channel];
+        for (int subband = 0; subband < 4; subband++)
+            ch_ptr[subband] = m_stream.read_network_order_bits(1) != 0;
     }
 
+    for (int granule = 0; granule < 2; granule++) {
+        for (int channel = 0; channel < channel_count; channel++) {
+            SideInfoSpec side_info;
+            side_info.part_23_length = (u16)m_stream.read_network_order_bits(12);
+            side_info.big_value_region_length = (u16)m_stream.read_network_order_bits(9);
+            side_info.global_gain = (u8)m_stream.read_network_order_bits(8);
+            side_info.scalefactor_compress = (u8)m_stream.read_network_order_bits(4);
+            side_info.slen1 = scalefactor_compress_index[side_info.scalefactor_compress][0];
+            side_info.slen2 = scalefactor_compress_index[side_info.scalefactor_compress][1];
+            side_info.window_switching_flag = (u8)m_stream.read_network_order_bits(1);
+
+            if (side_info.window_switching_flag) {
+                side_info.block_type = (u8)m_stream.read_network_order_bits(2);
+                if (side_info.block_type == 0) {
+                    dbg() << String::format("%d: window_switching_flag=%d, block_type=%d", m_stream.offset(), side_info.window_switching_flag, side_info.block_type);
+                    return false;
+                }
+                side_info.mixed_block_flag = (u8)m_stream.read_network_order_bits(1);
+                side_info.window_switch_point_long = (u8)(side_info.mixed_block_flag * 8);
+                side_info.window_switch_point_short = (u8)(side_info.mixed_block_flag * 3);
+                side_info.region0_count = (u8)(7 + (side_info.block_type == 2 && side_info.mixed_block_flag));
+
+                // The standard suggests this value should be 63. But source code of many implementations
+                // suggest that the standard is wrong on this.
+                side_info.region1_count = (u8)(20 - side_info.region0_count);
+
+                // region2 is empty when window switching is enabled.
+                side_info.table_select[0] = (u8)m_stream.read_network_order_bits(5);
+                side_info.table_select[1] = (u8)m_stream.read_network_order_bits(5);
+
+                // Gain offset from the global gain for each short block window.
+                side_info.subblock_gain[0] = (u8)m_stream.read_network_order_bits(3);
+                side_info.subblock_gain[1] = (u8)m_stream.read_network_order_bits(3);
+                side_info.subblock_gain[2] = (u8)m_stream.read_network_order_bits(3);
+            } else {
+                // Window switching is disabled.
+                side_info.table_select[0] = (u8)m_stream.read_network_order_bits(5);
+                side_info.table_select[1] = (u8)m_stream.read_network_order_bits(5);
+                side_info.table_select[2] = (u8)m_stream.read_network_order_bits(5);
+
+                side_info.region0_count = (u8)m_stream.read_network_order_bits(4);
+                side_info.region1_count = (u8)m_stream.read_network_order_bits(3);
+            }
+
+            side_info.preflag = (u8)m_stream.read_network_order_bits(1);
+            side_info.scalefactor_scale = (u8)m_stream.read_network_order_bits(1);
+            side_info.count1_table_select = (u8)m_stream.read_network_order_bits(1);
+
+            frame_spec.side_info[granule][channel] = side_info;
+        }
+    }
     return true;
 }
 
@@ -240,8 +292,8 @@ bool MpegAudioLoader::parse_frame()
     }
 
     FrameSpec& frame = m_context.frame_spec;
-    if (is_bad_frame_header()) {
-        dbg() << String::format("%d: bad frame header!", m_stream.offset());
+    if (is_frame_header_corrupted()) {
+        dbg() << String::format("%d: corrupt frame header!", m_stream.offset());
         return false;
     }
 
@@ -254,6 +306,8 @@ bool MpegAudioLoader::parse_frame()
         return false;
     }
 
+    for (int i = 0; i < 4; i++)
+        dbg() << String::format("%0X", m_stream.read_u8());
     return true;
 }
 

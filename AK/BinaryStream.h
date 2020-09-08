@@ -29,7 +29,7 @@
 #include "BufferStream.h"
 #include <AK/ByteBuffer.h>
 
-#define MIN(a, b) (a < b ? a : b)
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 namespace AK {
 
@@ -83,7 +83,7 @@ public:
             return 0;
         }
 
-        size_t number = 0;
+        size_t bits = 0;
         while (bit_count) {
             if (m_bit_offset > 7) {
                 m_bit_offset = 0;
@@ -92,12 +92,12 @@ public:
             u8 read_count = (u8)MIN(bit_count, 8u - m_bit_offset);
             u8 shift_width = (u8)8 - (m_bit_offset + read_count);
             u8 this_byte = (m_current_byte & (bitmask[read_count] << shift_width)) >> shift_width;
-            number = (number << read_count) | this_byte;
+            bits = (bits << read_count) | this_byte;
             bit_count -= read_count;
             m_bit_offset += read_count;
         }
 
-        return number;
+        return bits;
     }
 
     inline u8 read_u8()

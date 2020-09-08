@@ -37,4 +37,5 @@ compile_commands.json
 *Endpoint.h
 Ports/packages.db
 .idea/
+Base/res/audio/
 cmake-build-debug/
