@@ -27,6 +27,7 @@
 #pragma once
 
 #include <AK/BinaryStream.h>
+#include <AK/CircularQueue.h>
 #include <AK/String.h>
 #include <AK/Vector.h>
 
@@ -42,7 +43,7 @@ enum class CHANNEL_MODE {
 struct SideInfoSpec {
     // Number of bits allocated in the main data segment for scale factors (part2)
     // and huffman codes (part3).
-    u16 part_23_length { 0 };       // 12 bits
+    u16 part_23_length { 0 }; // 12 bits
 
     // Frequency components in the granule range from 0 to Nyquist frequency. To
     // enhance encoding efficiency, different huffman tables are used to encode
@@ -54,51 +55,49 @@ struct SideInfoSpec {
     u16 big_value_region_length { 0 }; // 9 bits
 
     // Quantization step size. Will be required while requantizing samples.
-    u8 global_gain { 0 };            // 8 bits
+    u8 global_gain { 0 }; // 8 bits
 
     // Number of bits used for scalefactor bands.
-    u8 scalefactor_compress { 0 };   // 4 bits
+    u8 scalefactor_compress { 0 }; // 4 bits
 
     u8 slen1 { 0 };
     u8 slen2 { 0 };
 
     // Whether window switching is enabled to switch between windows of long and short blocks.
-    u8 window_switching_flag { 0 };  // 1 bit
+    u8 window_switching_flag { 0 }; // 1 bit
 
     u8 window_switch_point_long { 0 };
     u8 window_switch_point_short { 0 };
 
     // Long or Short block type.
-    u8 block_type { 0 };             // 2 bits
+    u8 block_type { 0 }; // 2 bits
 
     // Specifies whether long and short blocks have been mixed in this granule.
-    u8 mixed_block_flag { 0 };       // 1 bit
+    u8 mixed_block_flag { 0 }; // 1 bit
 
     // This field specifies which huffman code table, out of all those defined
     // in the spec, is to be used for the 3 big value regions.
-    u8 table_select[3] = { 0 };     // 5 bits per region.
+    u8 table_select[3] = { 0 }; // 5 bits per region.
 
     // For each short block, indicates the gain offset from the global gain. Only
     // used when block type = 2 (short block), but transmitted regardless of the
     // value of block type.
-    u8 subblock_gain[3] = { 0 };     // 3 short block windows, 3 bits each.
+    u8 subblock_gain[3] = { 0 }; // 3 short block windows, 3 bits each.
 
-    u8 region0_count { 0 };          // 4 bits
+    u8 region0_count { 0 }; // 4 bits
 
-    u8 region1_count { 0 };          // 3 bits
+    u8 region1_count { 0 }; // 3 bits
 
     // If this field is set, a value picked from a table is added to the scalefactors.
-    u8 preflag { 0 };                // 1 bit
+    u8 preflag { 0 }; // 1 bit
 
-
-    u8 scalefactor_scale { 0 };      // 1 bit
+    u8 scalefactor_scale { 0 }; // 1 bit
 
     // Huffman code table for the count1 region.
-    u8 count1_table_select { 0 };    // 1 bit
+    u8 count1_table_select { 0 }; // 1 bit
 };
 
 struct FrameSpec {
-    // Header.
     u8 mpeg_version { 0 };
     bool is_mpeg25 { false };
     u8 layer { 0 };
@@ -128,10 +127,10 @@ struct FrameSpec {
     // Side info.
     u16 main_data_begin { 0 }; // 9 bits.
 
-    // scfsi[ch][scfsi_band] - in Layer III the scale factor selection information
+    // scfsi[ch][scfsi_band] - Stores the scale factor selection information and
     // works similarly to Layers I and II. The main difference is the use of the
     // variable scfsi_band​to apply scfsi to groups of scale factors instead of
-    // single scale factors. scfsi controls the use of scale factors to the granules.
+    // single scale factor. scfsi controls the use of scale factors to the granules.
     // 4 bits are transmitted per channel. If the bit at position x for band X is set,
     // then scale factor for that band is transmitted for one granule and the other
     // granule uses the same factors.
@@ -143,6 +142,16 @@ struct FrameSpec {
 
 struct MpegAudioContext {
     FrameSpec frame_spec;
+    Vector<u8> reservoir;
+    ssize_t main_data_begin_index { 0 };
+    size_t main_data_length { 0 };
+    bool can_decode_frame { false };
+
+    // Long window scale factor bands. factor[granule][chanel][band];
+    u8 long_window_sfband[2][2][21] = { 0 };
+    // Short window scale factor bands. factor[granule][channel][band][window]
+    u8 short_window_sfband[2][2][12][3] = { 0 };
+
     String id3_string;
     u8 id3_flags { 0 };
     String title;
@@ -155,17 +164,19 @@ struct MpegAudioContext {
 class MpegAudioLoader {
 public:
     MpegAudioLoader(BinaryStream&);
-    bool decode_mpeg_audio();
+    bool decode_frame();
 
 private:
-    bool parse_frame();
+    bool extract_frame();
     bool read_frame_header();
     bool bitrate_read_helper();
-    bool is_frame_header_corrupted();
+    bool is_corrupt_frame_header();
     bool read_side_info();
-    void compose_granule(SideInfoSpec& side_info);
+    bool shift_main_data_into_reservoir();
+    bool extract_main_data();
 
     MpegAudioContext m_context;
     BinaryStream& m_stream;
+    bool extract_scalefactors();
 };
 }

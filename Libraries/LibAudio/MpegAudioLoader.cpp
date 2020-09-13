@@ -68,7 +68,7 @@ static constexpr u32 frequency_index[3][3] = {
     { 32000, 16000, 8000 }
 };
 
-bool MpegAudioLoader::is_frame_header_corrupted()
+bool MpegAudioLoader::is_corrupt_frame_header()
 {
     FrameSpec& spec = m_context.frame_spec;
     if (spec.is_protected) {
@@ -128,12 +128,12 @@ bool MpegAudioLoader::read_frame_header()
 {
     FrameSpec& frame_spec = m_context.frame_spec;
     if (!m_stream.ensure_bytes(4)) {
-        dbg() << String::format("%d: insufficient bytes for frame header!", m_stream.offset());
+        dbg() << m_stream.offset() << ": insufficient bytes for frame header!";
         return false;
     }
 
-    if (m_stream.read_u8() != 0xFF || m_stream.read_network_order_bits(3) < 0x07) {
-        dbg() << String::format("%d: invalid sync word!", m_stream.offset());
+    if (m_stream.read_network_order_u8() != 0xFF || m_stream.read_network_order_bits(3) < 0x07) {
+        dbg() << m_stream.offset() << ": invalid sync word!";
         return false;
     }
 
@@ -186,7 +186,7 @@ bool MpegAudioLoader::read_frame_header()
     m_stream.skip_bits(1);
     auto channel_descriptor = m_stream.read_network_order_bits(2);
     if (channel_descriptor > 0x03) {
-        dbg() << String::format("%d: invalid channel descriptor!", m_stream.offset());
+        dbg() << m_stream.offset() << ": invalid channel descriptor!";
         return false;
     }
     frame_spec.channel_mode = (CHANNEL_MODE)channel_descriptor;
@@ -212,7 +212,7 @@ bool MpegAudioLoader::read_side_info()
     FrameSpec& frame_spec = m_context.frame_spec;
     bool is_mono = frame_spec.channel_mode == CHANNEL_MODE::MONO;
     if (!m_stream.ensure_bytes(is_mono ? 17 : 32)) {
-        dbg() << String::format("%d: insufficient bytes remaining for side info!", m_stream.offset());
+        dbg() << m_stream.offset() << ": insufficient bytes remaining for side info!";
         return false;
     }
 
@@ -244,7 +244,8 @@ bool MpegAudioLoader::read_side_info()
             if (side_info.window_switching_flag) {
                 side_info.block_type = (u8)m_stream.read_network_order_bits(2);
                 if (side_info.block_type == 0) {
-                    dbg() << String::format("%d: window_switching_flag=%d, block_type=%d", m_stream.offset(), side_info.window_switching_flag, side_info.block_type);
+                    const char* format = "%d: window_switching_flag=%d, block_type=%d";
+                    dbg() << String::format(format, m_stream.offset(), side_info.window_switching_flag, side_info.block_type);
                     return false;
                 }
                 side_info.mixed_block_flag = (u8)m_stream.read_network_order_bits(1);
@@ -257,18 +258,17 @@ bool MpegAudioLoader::read_side_info()
                 side_info.region1_count = (u8)(20 - side_info.region0_count);
 
                 // region2 is empty when window switching is enabled.
-                side_info.table_select[0] = (u8)m_stream.read_network_order_bits(5);
-                side_info.table_select[1] = (u8)m_stream.read_network_order_bits(5);
+                for (int i = 0; i < 2; i++)
+                    side_info.table_select[i] = (u8)m_stream.read_network_order_bits(5);
 
                 // Gain offset from the global gain for each short block window.
-                side_info.subblock_gain[0] = (u8)m_stream.read_network_order_bits(3);
-                side_info.subblock_gain[1] = (u8)m_stream.read_network_order_bits(3);
-                side_info.subblock_gain[2] = (u8)m_stream.read_network_order_bits(3);
+                for (int i = 0; i < 3; i++)
+                    side_info.subblock_gain[i] = (u8)m_stream.read_network_order_bits(3);
+
             } else {
-                // Window switching is disabled.
-                side_info.table_select[0] = (u8)m_stream.read_network_order_bits(5);
-                side_info.table_select[1] = (u8)m_stream.read_network_order_bits(5);
-                side_info.table_select[2] = (u8)m_stream.read_network_order_bits(5);
+                // Window switching is disabled. All three regions have codes.
+                for (int i = 0; i < 3; i++)
+                    side_info.table_select[i] = (u8)m_stream.read_network_order_bits(5);
 
                 side_info.region0_count = (u8)m_stream.read_network_order_bits(4);
                 side_info.region1_count = (u8)m_stream.read_network_order_bits(3);
@@ -284,45 +284,153 @@ bool MpegAudioLoader::read_side_info()
     return true;
 }
 
-bool MpegAudioLoader::parse_frame()
+bool MpegAudioLoader::shift_main_data_into_reservoir()
+{
+    auto& context = m_context;
+    auto& frame_spec = context.frame_spec;
+    auto& reservoir = context.reservoir;
+    bool is_mono = frame_spec.channel_mode == CHANNEL_MODE::MONO;
+
+    // main_data_length = frame length - (header length + CRC length + sideinfo length)
+    context.main_data_length = frame_spec.length - (4 + (frame_spec.is_protected * 2) + (is_mono ? 17 : 32));
+    if (!m_stream.ensure_bytes(context.main_data_length)) {
+        dbg() << m_stream.offset() << ": Insufficient bytes remaining for main data!";
+        return false;
+    }
+
+    Vector<u8> main_data;
+    main_data.ensure_capacity(context.main_data_length);
+
+    for (unsigned i = 0; i < context.main_data_length; i++)
+        // We are byte aligned at this point. Byte order doesn't really matter.
+        main_data.append(m_stream.read_network_order_u8());
+
+    // FIXME: We never shift out redundant main data. This is heavy on memory.
+    context.main_data_begin_index = reservoir.size() - frame_spec.main_data_begin;
+    context.can_decode_frame = m_context.main_data_begin_index >= 0;
+    reservoir.append(move(main_data));
+
+    return true;
+}
+
+bool MpegAudioLoader::extract_scalefactors()
+{
+    // Only used for long blocks.
+    static constexpr u8 group_to_band_range[4][2] = { { 0, 5 }, { 6, 10 }, { 11, 15 }, { 16, 20 } };
+
+    auto& context = m_context;
+    auto& frame_spec = context.frame_spec;
+    int channel_count = 1 + (frame_spec.channel_mode != CHANNEL_MODE::MONO);
+    // FIXME: Modify this when you start removing redundant main data from the reservoir.
+    ByteBuffer buffer = ByteBuffer::wrap((context.reservoir.data() + context.main_data_begin_index), context.main_data_length);
+    BinaryStream stream { buffer };
+
+    auto read_long_scalefactors = [&](int granule, int channel, int group) {
+        auto& side_info = context.frame_spec.side_info[granule][channel];
+        int start_band = group_to_band_range[group][0];
+        int end_band = group_to_band_range[group][1];
+        for (int band = start_band; band <= end_band; band++) {
+            u8 bits = band <= 10 ? side_info.slen1 : side_info.slen2;
+            context.long_window_sfband[granule][channel][band] = (u8)stream.read_network_order_bits(bits);
+        }
+    };
+
+    auto copy_long_scalefactors = [&](int granule, int channel, int group) {
+        int start_band = group_to_band_range[group][0];
+        int end_band = group_to_band_range[group][1];
+        for (int band = start_band; band <= end_band; band++)
+            context.long_window_sfband[granule][channel][band] = context.long_window_sfband[granule - 1][channel][band];
+    };
+
+    for (int granule = 0; granule < 2; granule++) {
+        for (int channel = 0; channel < channel_count; channel++) {
+            auto& side_info = frame_spec.side_info[granule][channel];
+            // If the block type is 2 (short blocks), scalefactors are transmitted for each granule.
+            if (side_info.block_type == 2 && side_info.window_switching_flag) {
+                if (side_info.mixed_block_flag) {
+                    // Block type = 2 = Short Blocks, mixed_block_flag set.
+                    // `slen1` applies to long window scalefactor bands in the range 0-7 and short window
+                    // scalefactor bands in the range 3-5. `slen2` applies to short window scalefactor bands
+                    // in the range 6-11.
+                    for (int band = 0; band <= 7; band++)
+                        context.long_window_sfband[granule][channel][band] = (u8)stream.read_network_order_bits(side_info.slen1);
+                    for (int band = 3; band <= 11; band++) {
+                        u8 bits = band <= 5 ? side_info.slen1 : side_info.slen2;
+                        for (int window = 0; window < 3; window++)
+                            context.short_window_sfband[granule][channel][band][window] = (u8)stream.read_network_order_bits(bits);
+                    }
+                } else {
+                    // Block type = 2 = Short block. mixed_block_flag not set.
+                    // `slen1` applies to long window scalefactor bands in the rang 0-5 and `slen2` applies
+                    // to short window scalefactor bands in the range 6-11.
+                    for (int band = 0; band <= 11; band++) {
+                        u8 bits = band <= 5 ? side_info.slen1 : side_info.slen2;
+                        for (int window = 0; window < 3; window++)
+                            context.short_window_sfband[granule][channel][band][window] = (u8)stream.read_network_order_bits(bits);
+                    }
+                }
+            } else {
+                // Block type 0 (Normal), 1 (Start), or 3 (Stop).
+                for (int group = 0; group < 4; group++) {
+                    bool scalefactors_shared = frame_spec.scfsi[channel][group];
+                    if(scalefactors_shared)
+                        copy_long_scalefactors(granule, channel, group);
+                    else
+                        read_long_scalefactors(granule, channel, group);
+                }
+            }
+
+            if (stream.handle_read_failure()) {
+                dbg() << "Failed to read scalefactors!";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool MpegAudioLoader::extract_frame()
 {
     if (!read_frame_header()) {
-        dbg() << String::format("%d: unable to parse frame header!", m_stream.offset());
+        dbg() << m_stream.offset() << ": unable to parse frame header!";
         return false;
     }
 
-    FrameSpec& frame = m_context.frame_spec;
-    if (is_frame_header_corrupted()) {
-        dbg() << String::format("%d: corrupt frame header!", m_stream.offset());
+    FrameSpec& frame_spec = m_context.frame_spec;
+    if (is_corrupt_frame_header()) {
+        dbg() << m_stream.offset() << ": corrupt frame header!";
         return false;
     }
 
-    auto slot_size = frame.layer == 1 ? 4 : 1;
-    frame.length = ((144 * frame.bitrate) / frame.sample_rate) + (frame.has_padding ? slot_size : 0);
-    debug_fmt("MPEG audio frame length=%dB", frame.length);
+    auto slot_size = frame_spec.layer == 1 ? 4 : 1;
+    frame_spec.length = ((144 * frame_spec.bitrate) / frame_spec.sample_rate) + (frame_spec.has_padding * slot_size);
+    debug_fmt("MPEG audio frame length=%dB", frame_spec.length);
 
     if (!read_side_info()) {
-        dbg() << String::format("%d: corrupt frame!", m_stream.offset());
+        dbg() << m_stream.offset() << ": corrupt frame!";
         return false;
     }
 
-    for (int i = 0; i < 4; i++)
-        dbg() << String::format("%0X", m_stream.read_u8());
-    return true;
+    m_stream.byte_align_forward();
+    return shift_main_data_into_reservoir();
 }
 
-bool MpegAudioLoader::decode_mpeg_audio()
+bool MpegAudioLoader::decode_frame()
 {
     if (!parse_id3(m_stream, m_context)) {
-        dbg() << String::format("%d: couldn't parse ID3 header!", m_stream.offset());
+        dbg() << m_stream.offset() << ": couldn't parse ID3 header!";
         return false;
     }
 
-    if (!parse_frame()) {
-        dbg() << String::format("%d: couldn't parse frame!", m_stream.offset());
+    do {
+        if (!extract_frame())
+            return false;
+    } while (!m_context.can_decode_frame);
+
+    if (!extract_scalefactors())
         return false;
-    }
 
     return true;
 }
+
 }

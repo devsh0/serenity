@@ -66,7 +66,7 @@ static bool parse_text_frame(BinaryStream& stream, MpegAudioContext& context, St
 
     StringBuilder data(size);
     for (size_t i = 0; i < size; i++) {
-        char tmp = (char)stream.read_u8();
+        char tmp = (char)stream.read_network_order_u8();
         data.append(tmp);
     }
 
@@ -172,7 +172,7 @@ static size_t parse_tag_header(BinaryStream& stream, MpegAudioContext& context)
 
     u32 tag_size = 0;
     for (int i = 0; i < 4; i++)
-        tag_size = (tag_size << 7) | stream.read_u8();
+        tag_size = (tag_size << 7) | stream.read_network_order_u8();
 
     return tag_size;
 }

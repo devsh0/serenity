@@ -100,7 +100,7 @@ public:
         return bits;
     }
 
-    inline u8 read_u8()
+    inline u8 read_network_order_u8()
     {
         return (u8)read_network_order_bits(8);
     }
