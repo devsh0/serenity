@@ -26,6 +26,7 @@
 
 #include "MpegAudioLoader.h"
 #include "ID3v2Parser.h"
+#include "MpegTables.h"
 
 #define MPEG_DEBUG 1
 #define debug_fmt(fmt, args...) \
@@ -36,37 +37,6 @@
     dbg() << arg
 
 namespace Audio {
-
-MpegAudioLoader::MpegAudioLoader(BinaryStream& stream)
-    : m_stream(stream)
-{
-}
-
-// Usage: Bitrate[descriptor-1][version-1][layer-1]
-static constexpr u32 bitrate_index[14][2][3] = {
-    // Pick this                                            If you see this
-    { { 32000, 32000, 32000 }, { 32000, 8000, 8000 } },         // 0b0001
-    { { 64000, 48000, 40000 }, { 48000, 16000, 16000 } },       // 0b0010
-    { { 96000, 56000, 48000 }, { 56000, 24000, 24000 } },       // 0b0011
-    { { 128000, 64000, 56000 }, { 64000, 32000, 32000 } },      // 0b0100
-    { { 160000, 80000, 64000 }, { 80000, 40000, 40000 } },      // 0b0101
-    { { 192000, 96000, 80000 }, { 96000, 48000, 48000 } },      // 0b0110
-    { { 224000, 112000, 96000 }, { 112000, 56000, 56000 } },    // 0b0111
-    { { 256000, 128000, 112000 }, { 128000, 64000, 64000 } },   // 0b1000
-    { { 288000, 160000, 128000 }, { 144000, 80000, 80000 } },   // 0b1001
-    { { 320000, 192000, 160000 }, { 160000, 96000, 96000 } },   // 0b1010
-    { { 352000, 224000, 192000 }, { 176000, 112000, 112000 } }, // 0b1011
-    { { 384000, 256000, 224000 }, { 192000, 128000, 128000 } }, // 0b1100
-    { { 416000, 320000, 256000 }, { 224000, 144000, 144000 } }, // 0b1101
-    { { 448000, 384000, 320000 }, { 256000, 160000, 160000 } }  // 0b1110
-};
-
-// Usage: Frequency[descriptor][version-1]
-static constexpr u32 frequency_index[3][3] = {
-    { 44100, 22050, 11025 },
-    { 48000, 24000, 12000 },
-    { 32000, 16000, 8000 }
-};
 
 bool MpegAudioLoader::is_corrupt_frame_header()
 {
@@ -313,6 +283,78 @@ bool MpegAudioLoader::shift_main_data_into_reservoir()
     return true;
 }
 
+Vector<u32> MpegAudioLoader::huffman_decode(unsigned table)
+{
+}
+
+// FIXME: This is a placeholder. The logic of this function doesn't make sense.
+size_t get_main_pos()
+{
+    return 10;
+}
+
+// FIXME: This is a placeholder. The logic of this function doesn't make sense.
+int set_main_pos(MpegAudioContext& context, size_t position)
+{
+    return (int)(context.long_window_sfband[0][0][0] + position);
+}
+
+void MpegAudioLoader::extract_huffman_data(int granule, int channel)
+{
+    auto& context = m_context;
+    auto& side_info = context.frame_spec.side_info[granule][channel];
+
+    // There's nothing to decode.
+    if (side_info.part_23_length == 0)
+        return;
+
+    int region0 = 0;
+    int region1 = 0;
+    if (side_info.window_switching_flag && side_info.block_type == 2) {
+        region0 = 36;
+        region1 = 576;
+    } else {
+        region0 = band_index[context.frame_spec.sample_rate].long_bands[side_info.region0_count + 1];
+        region1 = band_index[context.frame_spec.sample_rate].long_bands[side_info.region1_count + 1];
+    }
+
+    unsigned table = 0;
+    Vector<u32> decoded;
+
+    // Read big values.
+    for (size_t sample = 0; sample < side_info.big_value_region_length * 2; sample++) {
+        int index = sample < region0 ? 0 : (sample < region1 ? 1 : 2);
+        table = side_info.table_select[index];
+        decoded = huffman_decode(table);
+        context.samples[granule][channel][sample++] = decoded[0];
+        context.samples[granule][channel][sample] = decoded[1];
+    }
+
+    // Read count1/quad values.
+    table = side_info.count1_table_select + 32;
+    size_t sample = side_info.big_value_region_length * 2u;
+    size_t bit_pos_end = 100; // FIXME: This is a placeholder.
+    for (; sample <= 572 && get_main_pos() <= bit_pos_end; sample++) {
+        decoded = huffman_decode(table);
+        context.samples[granule][channel][sample++] = decoded[2];
+        if (sample >= 576)
+            break;
+        context.samples[granule][channel][sample++] = decoded[3];
+        if (sample >= 576)
+            break;
+        context.samples[granule][channel][sample++] = decoded[0];
+        if (sample >= 576)
+            break;
+        context.samples[granule][channel][sample] = decoded[1];
+    }
+
+    // Check that we didn't read past the end of this section.
+    bit_pos_end += 1;
+    sample -= 4 * (get_main_pos() > bit_pos_end);
+    context.count1[granule][channel] = sample;
+    set_main_pos(context, bit_pos_end);
+}
+
 bool MpegAudioLoader::extract_scalefactors()
 {
     // Only used for long blocks.
@@ -345,13 +387,11 @@ bool MpegAudioLoader::extract_scalefactors()
     for (int granule = 0; granule < 2; granule++) {
         for (int channel = 0; channel < channel_count; channel++) {
             auto& side_info = frame_spec.side_info[granule][channel];
-            // If the block type is 2 (short blocks), scalefactors are transmitted for each granule.
+            // For short blocks, scalefactors are transmitted for each granule.
             if (side_info.block_type == 2 && side_info.window_switching_flag) {
                 if (side_info.mixed_block_flag) {
-                    // Block type = 2 = Short Blocks, mixed_block_flag set.
-                    // `slen1` applies to long window scalefactor bands in the range 0-7 and short window
-                    // scalefactor bands in the range 3-5. `slen2` applies to short window scalefactor bands
-                    // in the range 6-11.
+                    // Short Blocks, mixed_block_flag set. `slen1` applies to long window scalefactor bands in the range 0-7 and short
+                    // window scalefactor bands in the range 3-5. `slen2` applies to short window scalefactor bands in the range 6-11.
                     for (int band = 0; band <= 7; band++)
                         context.long_window_sfband[granule][channel][band] = (u8)stream.read_network_order_bits(side_info.slen1);
                     for (int band = 3; band <= 11; band++) {
@@ -360,9 +400,8 @@ bool MpegAudioLoader::extract_scalefactors()
                             context.short_window_sfband[granule][channel][band][window] = (u8)stream.read_network_order_bits(bits);
                     }
                 } else {
-                    // Block type = 2 = Short block. mixed_block_flag not set.
-                    // `slen1` applies to long window scalefactor bands in the rang 0-5 and `slen2` applies
-                    // to short window scalefactor bands in the range 6-11.
+                    // Short block, mixed_block_flag not set. `slen1` applies to long window scalefactor bands in the rang 0-5 and `slen2`
+                    // applies to short window scalefactor bands in the range 6-11.
                     for (int band = 0; band <= 11; band++) {
                         u8 bits = band <= 5 ? side_info.slen1 : side_info.slen2;
                         for (int window = 0; window < 3; window++)
@@ -373,7 +412,7 @@ bool MpegAudioLoader::extract_scalefactors()
                 // Block type 0 (Normal), 1 (Start), or 3 (Stop).
                 for (int group = 0; group < 4; group++) {
                     bool scalefactors_shared = frame_spec.scfsi[channel][group];
-                    if(scalefactors_shared)
+                    if (scalefactors_shared)
                         copy_long_scalefactors(granule, channel, group);
                     else
                         read_long_scalefactors(granule, channel, group);
@@ -384,6 +423,8 @@ bool MpegAudioLoader::extract_scalefactors()
                 dbg() << "Failed to read scalefactors!";
                 return false;
             }
+
+            extract_huffman_data(granule, channel);
         }
     }
     return true;

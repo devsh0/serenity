@@ -152,6 +152,11 @@ struct MpegAudioContext {
     // Short window scale factor bands. factor[granule][channel][band][window]
     u8 short_window_sfband[2][2][12][3] = { 0 };
 
+    // samples[granule][channel][frequency_line]
+    float samples[2][2][576] = { 0.0 };
+    // count1[granule][channel]
+    float count1[2][2] = { 0.0 };
+
     String id3_string;
     u8 id3_flags { 0 };
     String title;
@@ -174,6 +179,8 @@ private:
     bool read_side_info();
     bool shift_main_data_into_reservoir();
     bool extract_main_data();
+    void extract_huffman_data(int granule, int channel);
+    Vector<u32> huffman_decode(unsigned table);
 
     MpegAudioContext m_context;
     BinaryStream& m_stream;
