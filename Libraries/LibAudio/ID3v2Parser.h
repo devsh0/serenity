@@ -31,6 +31,6 @@
 
 namespace Audio {
 
-bool parse_id3(BinaryStream&, MpegAudioContext&);
+bool parse_id3(BinaryStream&, AudioMeta&);
 
 }

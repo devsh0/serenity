@@ -54,7 +54,7 @@ static String read_string(BinaryStream& stream, u8 encoding)
     return builder.build();
 }
 
-static bool parse_text_frame(BinaryStream& stream, MpegAudioContext& context, String id, size_t size)
+static bool parse_text_frame(BinaryStream& stream, AudioMeta& metadata, String id, size_t size)
 {
     if (!stream.ensure_bytes(size))
         return false;
@@ -72,18 +72,18 @@ static bool parse_text_frame(BinaryStream& stream, MpegAudioContext& context, St
 
     // TODO: Maybe collect data from a couple of other frames?
     if (id == "TALB")
-        context.album_title = data.build();
+        metadata.album_title = data.build();
     else if (id == "TIT2")
-        context.title = data.build();
+        metadata.title = data.build();
     else if (id == "TYER")
-        context.year = data.build();
+        metadata.year = data.build();
     else
         debug_fmt("%s ignored", id.characters());
 
     return true;
 }
 
-static bool parse_picture_frame(BinaryStream& stream, MpegAudioContext& context, size_t size)
+static bool parse_picture_frame(BinaryStream& stream, AudioMeta& metadata, size_t size)
 {
     if (!stream.ensure_bytes(size)) {
         dbg() << String::format("%d: insufficient bytes remaining for picture frame!");
@@ -103,7 +103,7 @@ static bool parse_picture_frame(BinaryStream& stream, MpegAudioContext& context,
     //  is not consistent. Meaning that if the string contains bytes other than the null-character and is terminated
     //  by the null-byte, then the constructed string's length will include the null byte.
     to_read -= (mime.length() ? mime.length() : 1);
-    context.cover_art_mime = mime;
+    metadata.cover_art_mime = mime;
 
     // Ignoring picture type.
     stream.skip_bytes(1);
@@ -113,15 +113,15 @@ static bool parse_picture_frame(BinaryStream& stream, MpegAudioContext& context,
     String description = read_string(stream, encoding);
     to_read -= (description.length() ? description.length() : 1);
 
-    if (context.cover_art.size() < to_read) {
-        context.cover_art.resize(to_read);
+    if (metadata.cover_art.size() < to_read) {
+        metadata.cover_art.resize(to_read);
         for (u32 i = 0; i < to_read; i++)
-            stream >> context.cover_art[i];
+            stream >> metadata.cover_art[i];
     }
     return true;
 }
 
-static size_t parse_frame(BinaryStream& stream, MpegAudioContext& context)
+static size_t parse_frame(BinaryStream& stream, AudioMeta& metadata)
 {
     if (!stream.ensure_bytes(10)) {
         dbg() << String::format("%d: insufficient bytes remaining for ID3 header!", stream.offset());
@@ -139,14 +139,14 @@ static size_t parse_frame(BinaryStream& stream, MpegAudioContext& context)
     stream >> status_flags >> encode_flags;
 
     if (frame_id[0] == 'T' && frame_id[1] != 'X') {
-        parse_text_frame(stream, context, frame_id, frame_size);
+        parse_text_frame(stream, metadata, frame_id, frame_size);
     } else if (frame_id == "APIC") {
-        parse_picture_frame(stream, context, frame_size);
+        parse_picture_frame(stream, metadata, frame_size);
     }
     return 10 + frame_size;
 }
 
-static size_t parse_tag_header(BinaryStream& stream, MpegAudioContext& context)
+static size_t parse_tag_header(BinaryStream& stream, AudioMeta& metadata)
 {
     if (!stream.ensure_bytes(10))
         return 0;
@@ -165,10 +165,10 @@ static size_t parse_tag_header(BinaryStream& stream, MpegAudioContext& context)
     builder.append('0' + minor);
     builder.append('.');
     builder.append('0' + revision);
-    context.id3_string = builder.build();
+    metadata.id3_string = builder.build();
 
     // FIXME: ignored
-    stream >> context.id3_flags;
+    stream >> metadata.id3_flags;
 
     u32 tag_size = 0;
     for (int i = 0; i < 4; i++)
@@ -198,14 +198,13 @@ inline bool valid_tag_ahead(BinaryStream& stream)
 
 // FIXME: we ignore text encoding everywhere, which will cause this to
 //  break for non-ascii strings.
-bool parse_id3(BinaryStream& stream, MpegAudioContext& context)
+bool parse_id3(BinaryStream& stream, AudioMeta& metadata)
 {
     while (valid_tag_ahead(stream)) {
-        ssize_t tag_size = parse_tag_header(stream, context);
+        ssize_t tag_size = parse_tag_header(stream, metadata);
         debug_fmt("ID3v2 tag size=%d", tag_size);
-        while (valid_frame_ahead(stream)) {
-            tag_size -= parse_frame(stream, context);
-        }
+        while (valid_frame_ahead(stream))
+            tag_size -= parse_frame(stream, metadata);
 
         // Consume the padded bytes.
         while (tag_size > 0) {
