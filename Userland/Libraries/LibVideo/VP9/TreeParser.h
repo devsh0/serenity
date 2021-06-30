@@ -41,8 +41,7 @@ public:
         TreeSelectionValue m_value;
     };
 
-    template<typename T = int>
-    T parse_tree(SyntaxElementType type);
+    int parse_tree(SyntaxElementType type);
     TreeSelection select_tree(SyntaxElementType type);
     u8 select_tree_probability(SyntaxElementType type, u8 node);
     void count_syntax_element(SyntaxElementType type, int value);
