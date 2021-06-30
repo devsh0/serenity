@@ -6,8 +6,6 @@
 
 #pragma once
 
-#include "Symbols.h"
-
 namespace Video::VP9 {
 
 enum FrameType {
@@ -81,7 +79,6 @@ enum BlockSubsize : u8 {
     Block_32x64 = 10,
     Block_64x32 = 11,
     Block_64x64 = 12,
-    Block_Invalid = BLOCK_INVALID
 };
 
 }
