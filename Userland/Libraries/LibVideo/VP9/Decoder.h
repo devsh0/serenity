@@ -10,7 +10,6 @@
 #include "LookupTables.h"
 #include "ProbabilityTables.h"
 #include "SyntaxElementCounter.h"
-#include "TreeParser.h"
 #include <AK/ByteBuffer.h>
 #include <AK/OwnPtr.h>
 
@@ -133,8 +132,6 @@ private:
     u32 m_mi_col_start { 0 };
     u32 m_mi_col_end { 0 };
 
-    bool m_use_hp { false };
-
     TXMode m_tx_mode;
     ReferenceMode m_reference_mode;
     ReferenceFrame m_comp_fixed_ref;
@@ -143,7 +140,6 @@ private:
     OwnPtr<BitStream> m_bit_stream;
     OwnPtr<ProbabilityTables> m_probability_tables;
     OwnPtr<SyntaxElementCounter> m_syntax_element_counter;
-    NonnullOwnPtr<TreeParser> m_tree_parser;
 };
 
 }
