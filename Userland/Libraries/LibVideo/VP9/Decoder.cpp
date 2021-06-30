@@ -12,10 +12,6 @@ namespace Video::VP9 {
     if (m_bit_stream->read_bit() != 0) \
     return false
 
-#define SAFE_CALL(call)       \
-    if (!(call)) [[unlikely]] \
-    return false
-
 Decoder::Decoder()
     : m_probability_tables(make<ProbabilityTables>())
     , m_tree_parser(make<TreeParser>(*this))
@@ -27,9 +23,11 @@ bool Decoder::parse_frame(const ByteBuffer& frame_data)
     m_bit_stream = make<BitStream>(frame_data.data(), frame_data.size());
     m_syntax_element_counter = make<SyntaxElementCounter>();
 
-    SAFE_CALL(uncompressed_header());
+    if (!uncompressed_header())
+        return false;
     dbgln("Finished reading uncompressed header");
-    SAFE_CALL(trailing_bits());
+    if (!trailing_bits())
+        return false;
     if (m_header_size_in_bytes == 0) {
         // FIXME: Do we really need to read all of these bits?
         // while (m_bit_stream->get_position() < m_start_bit_pos + (8 * frame_data.size()))
@@ -41,14 +39,17 @@ bool Decoder::parse_frame(const ByteBuffer& frame_data)
     m_probability_tables->load_probs2(m_frame_context_idx);
     m_syntax_element_counter->clear_counts();
 
-    SAFE_CALL(m_bit_stream->init_bool(m_header_size_in_bytes));
+    if (!m_bit_stream->init_bool(m_header_size_in_bytes))
+        return false;
     dbgln("Reading compressed header");
-    SAFE_CALL(compressed_header());
+    if (!compressed_header())
+        return false;
     dbgln("Finished reading compressed header");
-    SAFE_CALL(m_bit_stream->exit_bool());
+    if (!m_bit_stream->exit_bool())
+        return false;
     dbgln("Finished reading frame!");
 
-    SAFE_CALL(decode_tiles());
+    decode_tiles();
     return true;
 }
 
@@ -77,10 +78,14 @@ bool Decoder::uncompressed_header()
     m_error_resilient_mode = m_bit_stream->read_bit();
 
     if (m_frame_type == KeyFrame) {
-        SAFE_CALL(frame_sync_code());
-        SAFE_CALL(color_config());
-        SAFE_CALL(frame_size());
-        SAFE_CALL(render_size());
+        if (!frame_sync_code())
+            return false;
+        if (!color_config())
+            return false;
+        if (!frame_size())
+            return false;
+        if (!render_size())
+            return false;
         m_refresh_frame_flags = 0xFF;
         m_frame_is_intra = true;
     } else {
@@ -93,9 +98,11 @@ bool Decoder::uncompressed_header()
         }
 
         if (m_frame_is_intra) {
-            SAFE_CALL(frame_sync_code());
+            if (!frame_sync_code())
+                return false;
             if (m_profile > 0) {
-                SAFE_CALL(color_config());
+                if (!color_config())
+                    return false;
             } else {
                 m_color_space = Bt601;
                 m_subsampling_x = true;
@@ -104,17 +111,19 @@ bool Decoder::uncompressed_header()
             }
 
             m_refresh_frame_flags = m_bit_stream->read_f8();
-            SAFE_CALL(frame_size());
-            SAFE_CALL(render_size());
+            if (!frame_size())
+                return false;
+            if (!render_size())
+                return false;
         } else {
             m_refresh_frame_flags = m_bit_stream->read_f8();
             for (auto i = 0; i < 3; i++) {
                 m_ref_frame_idx[i] = m_bit_stream->read_f(3);
                 m_ref_frame_sign_bias[LastFrame + i] = m_bit_stream->read_bit();
             }
-            SAFE_CALL(frame_size_with_refs());
+            frame_size_with_refs();
             m_allow_high_precision_mv = m_bit_stream->read_bit();
-            SAFE_CALL(read_interpolation_filter());
+            read_interpolation_filter();
         }
     }
 
@@ -128,7 +137,7 @@ bool Decoder::uncompressed_header()
 
     m_frame_context_idx = m_bit_stream->read_f(2);
     if (m_frame_is_intra || m_error_resilient_mode) {
-        SAFE_CALL(setup_past_independence());
+        setup_past_independence();
         if (m_frame_type == KeyFrame || m_error_resilient_mode || m_reset_frame_context == 3) {
             for (auto i = 0; i < 4; i++) {
                 m_probability_tables->save_probs(i);
@@ -139,10 +148,10 @@ bool Decoder::uncompressed_header()
         m_frame_context_idx = 0;
     }
 
-    SAFE_CALL(loop_filter_params());
-    SAFE_CALL(quantization_params());
-    SAFE_CALL(segmentation_params());
-    SAFE_CALL(tile_info());
+    loop_filter_params();
+    quantization_params();
+    segmentation_params();
+    tile_info();
 
     m_header_size_in_bytes = m_bit_stream->read_f16();
 
@@ -196,7 +205,7 @@ bool Decoder::frame_size()
 {
     m_frame_width = m_bit_stream->read_f16() + 1;
     m_frame_height = m_bit_stream->read_f16() + 1;
-    SAFE_CALL(compute_image_size());
+    compute_image_size();
     return true;
 }
 
@@ -225,13 +234,12 @@ bool Decoder::frame_size_with_refs()
         }
     }
 
-    if (!found_ref) {
-        SAFE_CALL(frame_size());
-    } else {
-        SAFE_CALL(compute_image_size());
-    }
+    if (!found_ref)
+        frame_size();
+    else
+        compute_image_size();
 
-    SAFE_CALL(render_size());
+    render_size();
     return true;
 }
 
@@ -310,7 +318,8 @@ bool Decoder::segmentation_params()
         }
     }
 
-    SAFE_CALL(m_bit_stream->read_bit());
+    if (!m_bit_stream->read_bit())
+        return true;
 
     m_segmentation_abs_or_delta_update = m_bit_stream->read_bit();
     for (auto i = 0; i < MAX_SEGMENTS; i++) {
@@ -408,23 +417,23 @@ bool Decoder::trailing_bits()
 
 bool Decoder::compressed_header()
 {
-    SAFE_CALL(read_tx_mode());
+    read_tx_mode();
     if (m_tx_mode == TXModeSelect) {
-        SAFE_CALL(tx_mode_probs());
+        tx_mode_probs();
     }
-    SAFE_CALL(read_coef_probs());
-    SAFE_CALL(read_skip_prob());
+    read_coef_probs();
+    read_skip_prob();
     if (!m_frame_is_intra) {
-        SAFE_CALL(read_inter_mode_probs());
+        read_inter_mode_probs();
         if (m_interpolation_filter == Switchable) {
-            SAFE_CALL(read_interp_filter_probs());
+            read_interp_filter_probs();
         }
-        SAFE_CALL(read_is_inter_probs());
-        SAFE_CALL(frame_reference_mode());
-        SAFE_CALL(frame_reference_mode_probs());
-        SAFE_CALL(read_y_mode_probs());
-        SAFE_CALL(read_partition_probs());
-        SAFE_CALL(mv_probs());
+        read_is_inter_probs();
+        frame_reference_mode();
+        frame_reference_mode_probs();
+        read_y_mode_probs();
+        read_partition_probs();
+        mv_probs();
     }
     return true;
 }
@@ -579,7 +588,7 @@ bool Decoder::frame_reference_mode()
                 m_reference_mode = CompoundReference;
             else
                 m_reference_mode = ReferenceModeSelect;
-            SAFE_CALL(setup_compound_reference_mode());
+            setup_compound_reference_mode();
         }
     } else {
         m_reference_mode = SingleReference;
@@ -710,7 +719,8 @@ bool Decoder::decode_tiles()
 {
     auto tile_cols = 1 << m_tile_cols_log2;
     auto tile_rows = 1 << m_tile_rows_log2;
-    SAFE_CALL(clear_above_context());
+    if (!clear_above_context())
+        return false;
     for (auto tile_row = 0; tile_row < tile_rows; tile_row++) {
         for (auto tile_col = 0; tile_col < tile_cols; tile_col++) {
             auto last_tile = (tile_row == tile_rows - 1) && (tile_col == tile_cols - 1);
@@ -720,9 +730,9 @@ bool Decoder::decode_tiles()
             m_mi_row_end = get_tile_offset(tile_row + 1, m_mi_rows, m_tile_rows_log2);
             m_mi_col_start = get_tile_offset(tile_col, m_mi_cols, m_tile_cols_log2);
             m_mi_col_end = get_tile_offset(tile_col + 1, m_mi_cols, m_tile_cols_log2);
-            SAFE_CALL(m_bit_stream->init_bool(tile_size));
-            SAFE_CALL(decode_tile());
-            SAFE_CALL(m_bit_stream->exit_bool());
+            m_bit_stream->init_bool(tile_size);
+            decode_tile();
+            m_bit_stream->exit_bool();
         }
     }
 
@@ -756,11 +766,13 @@ u32 Decoder::get_tile_offset(u32 tile_num, u32 mis, u32 tile_size_log2)
 bool Decoder::decode_tile()
 {
     for (auto row = m_mi_row_start; row < m_mi_row_end; row += 8) {
-        SAFE_CALL(clear_left_context());
+        if (!clear_left_context())
+            return false;
         m_row = row;
         for (auto col = m_mi_col_start; col < m_mi_col_end; col += 8) {
             m_col = col;
-            SAFE_CALL(decode_partition(row, col, Block_64x64));
+            if (!decode_partition(row, col, Block_64x64))
+                return false;
         }
     }
     return true;
@@ -789,9 +801,11 @@ bool Decoder::decode_partition(u32 row, u32 col, u8 block_subsize)
 
     auto subsize = subsize_lookup[partition][block_subsize];
     if (subsize < Block_8x8 || partition == PartitionNone) {
-        SAFE_CALL(decode_block(row, col, subsize));
+        if (!decode_block(row, col, subsize))
+            return false;
     } else if (partition == PartitionHorizontal) {
-        SAFE_CALL(decode_block(row, col, subsize));
+        if (!decode_block(row, col, subsize))
+            return false;
         // FIXME: if (hasRows)
         //            decode_block(r + halfBlock8x8, c, subsize)
     }
@@ -807,7 +821,8 @@ bool Decoder::decode_block(u32 row, u32 col, u8 subsize)
     m_mi_size = subsize;
     m_available_u = row > 0;
     m_available_l = col > m_mi_col_start;
-    SAFE_CALL(mode_info());
+    if (!mode_info())
+        return false;
     // FIXME: Finish implementing
     return true;
 }
@@ -821,9 +836,12 @@ bool Decoder::mode_info()
 
 bool Decoder::intra_frame_mode_info()
 {
-    SAFE_CALL(intra_segment_id());
-    SAFE_CALL(read_skip());
-    SAFE_CALL(read_tx_size(true));
+    if (!intra_segment_id())
+        return false;
+    if (!read_skip())
+        return false;
+    if (!read_tx_size(true))
+        return false;
     // FIXME: Finish implementing
     return true;
 }
