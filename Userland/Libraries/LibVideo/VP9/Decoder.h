@@ -22,7 +22,7 @@ class Decoder {
 public:
     Decoder();
     ~Decoder();
-    bool parse_frame(ByteBuffer const&);
+    bool parse_frame(const ByteBuffer&);
     void dump_info();
 
 private:
